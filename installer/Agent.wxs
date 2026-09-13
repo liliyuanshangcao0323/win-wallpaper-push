@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Win 壁纸推送 —— 被控端 MSI 安装包
+
+  设计要点（都是踩过坑之后定的）：
+
+  1. perMachine 安装到 C:\Program Files\WinWallpaperPush\
+     这样 GPO / SCCM / Intune 才能用 msiexec /qn 无人值守批量下发。
+
+  2. 开机自启写在 HKLM\...\Run，而不是做成 Windows 服务。
+     原因：桌面壁纸是「每用户」设置。服务跑在会话 0（session 0），
+     它能改的只是 SYSTEM 账户的壁纸，用户根本看不到。必须让被控端
+     在「每个用户自己的登录会话」里运行，所以用 HKLM Run 最合适。
+
+  3. 防火墙规则按「端口」放行，不绑定具体 exe 路径。
+     早期版本写的是 Program="[#FileAgentExe]"，看着更收敛，但一旦程序路径变了
+     （换目录、换打包方式、单文件解包出来的子进程路径不同），规则就会静默失配
+     —— 表现正好是最难查的「装好了、进程也在、就是收不到推送」。
+     端口规则和免安装版 add_firewall_rules.bat 完全一致，那套在现场验证过能用。
+     被控端只监听 UDP 38571 一个入站端口，收敛性上可以接受。
+
+  4. 卸载/升级前先用 taskkill 结束正在运行的被控端。
+     原因：单文件打包的 exe 会在整个运行期间占着自身文件，
+     不先结束掉，MSI 替换文件会失败（错误 1942）或者要求重启。
+     这个自定义动作是 deferred + Impersonate=no，即以 SYSTEM 身份执行。
+
+  5. 配置放 C:\ProgramData\WinWallpaperPush\ 并给 Users 写权限。
+     程序装在 Program Files 下，普通用户在那里存不了配置。
+
+  6. 装完不会立刻启动：桌面壁纸是「每用户」设置，MSI 是 SYSTEM 身份跑的，
+     没办法把进程塞进某个用户的登录会话。自启项写在 HKLM Run，用户下次登录
+     就起来了（install_agent.bat 会顺手在当前会话里先起一个）。
+
+  7. 开始菜单放两个入口：把窗口叫出来 + 文字控制台（状态 / 停止 / 看日志）。
+     被控端是静默后台、没有托盘图标，没有这两个入口，用户既不知道它在不在跑，
+     也不知道该怎么关掉它。
+
+  8. 面板口令（第一次运行设置，之后打开面板 / 停止 / 卸载都要输入）。
+     普通用户能写的地方（自己的配置、HKCU）只能当兜底：把哈希放在
+     ProgramData\WinWallpaperPush\secure\ 并设成「Users 只读」，用户才删不掉
+     也改不掉，口令才真的拦得住人。管理员用 WallpaperAgent.exe 的 set-password
+     参数写入这个目录。
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:fire="http://schemas.microsoft.com/wix/FirewallExtension"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+  <Product Id="*"
+           Name="Win 壁纸推送 被控端"
+           Language="2052"
+           Version="1.2.0.0"
+           Manufacturer="WinWallpaperPush"
+           UpgradeCode="6C5CD981-1939-4A76-B5AB-0A1173653E8D">
+
+    <Package Id="*"
+             Keywords="Installer,Wallpaper,Lan"
+             Description="接收局域网广播并更换 Windows 桌面壁纸"
+             Comments="适用于 GPO / SCCM / Intune 静默部署：msiexec /i WallpaperAgent.msi /qn"
+             Manufacturer="WinWallpaperPush"
+             InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="x64" />
+
+    <!-- 升级安装：允许同版本重装，禁止降级 -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="已安装更新版本的 Win 壁纸推送 被控端，无需降级安装。" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- 静默部署为主；手动双击时给一个最小向导 -->
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <UIRef Id="WixUI_Minimal" />
+
+    <!-- WixUI_Minimal 自己会写入 ARPNOMODIFY，这里不要再重复定义 -->
+    <Property Id="ARPCOMMENTS" Value="局域网壁纸集中推送 - 被控端" />
+
+    <!-- ============================================================
+         目录结构
+         ============================================================ -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="WinWallpaperPush">
+
+          <Component Id="CmpAgentExe" Guid="B73FED6B-95B1-4FA0-9E6B-8D816577CBFE" Win64="yes">
+            <File Id="FileAgentExe"
+                  Source="..\dist\WallpaperAgent.exe"
+                  KeyPath="yes"
+                  Vital="yes" />
+
+            <!-- 入站 UDP 38571：接收控制端的壁纸广播 + 逐台单播探测。
+                 只按端口放行，不绑定 exe 路径 —— 理由见文件开头第 3 条。
+                 IgnoreFailure：目标机器上防火墙服务被停用时，
+                 安装仍然继续，不因为加不了规则而整体失败
+                 （install_agent.bat 装完会复查，缺了就补上）。 -->
+            <fire:FirewallException Id="FwAgentUdp"
+                                    Name="Win Wallpaper Push Agent (UDP 38571)"
+                                    Description="允许接收局域网壁纸推送广播"
+                                    Protocol="udp"
+                                    Port="38571"
+                                    Profile="all"
+                                    Scope="any"
+                                    IgnoreFailure="yes" />
+
+            <!-- ============================================================
+                 开始菜单：静默后台 + 没有托盘图标，用户需要有地方能
+                 「看见它 / 停掉它 / 看日志」，否则只能去任务管理器
+                 ============================================================ -->
+            <Shortcut Id="ScShowWindow"
+                      Directory="ProgramMenuDir"
+                      Name="显示壁纸接收端窗口"
+                      Description="把后台静默运行的被控端窗口叫出来（可以看到状态、点退出）"
+                      Target="[#FileAgentExe]"
+                      Arguments="--show"
+                      WorkingDirectory="INSTALLFOLDER" />
+
+            <RemoveFolder Id="RmProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
+          </Component>
+
+          <Component Id="CmpConsole" Guid="9C0F0F4E-6D2B-4A19-9C71-73A0B4E5D3A1" Win64="yes">
+            <!-- 文字控制台（纯 ASCII 批处理）：状态 / 停止 / 看日志 -->
+            <File Id="FileAgentConsole" Source="agent_console.bat" KeyPath="yes" />
+            <Shortcut Id="ScConsole"
+                      Directory="ProgramMenuDir"
+                      Name="壁纸接收端控制台（状态、停止、看日志）"
+                      Description="查看运行状态、停止后台运行、打开日志文件"
+                      Target="[#FileAgentConsole]"
+                      WorkingDirectory="INSTALLFOLDER" />
+          </Component>
+
+          <Component Id="CmpReadme" Guid="030C9B1D-A737-4653-B8B3-DB9746A82AE3" Win64="yes">
+            <File Id="FileReadme" Source="README-AGENT.md" KeyPath="yes" />
+          </Component>
+
+        </Directory>
+      </Directory>
+
+      <!-- 机器级配置目录：管理员可集中下发端口 / 契合度等参数 -->
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="DATAFOLDER" Name="WinWallpaperPush">
+
+          <Component Id="CmpConfig" Guid="3B7BF214-1F4E-46E2-94B6-70B20421FDFE" Win64="yes">
+            <File Id="FileConfig" Source="agent_config.default.json" KeyPath="yes" />
+            <CreateFolder>
+              <!-- 程序运行在 Program Files 下，配置文件必须让普通用户写得进去，
+                   否则每次启动都会因为保存配置失败而报错。
+                   文件夹随文件一起删除，卸载时不会残留。 -->
+              <util:PermissionEx User="Users"
+                                 GenericRead="yes"
+                                 GenericWrite="yes"
+                                 GenericExecute="yes"
+                                 Delete="yes"
+                                 Synchronize="yes" />
+            </CreateFolder>
+          </Component>
+
+          <!-- 口令目录：只有管理员能写、普通用户只能读。
+               面板/停止/卸载都要口令，哈希放这里普通用户就改不掉也删不掉
+               （放在用户可写的地方，删掉文件就能绕过口令）。
+               管理员用 WallpaperAgent.exe 的 set-password 参数写进这个目录。 -->
+          <Directory Id="SECUREFOLDER" Name="secure">
+            <Component Id="CmpSecureDir" Guid="5D1B2C3A-9E44-4F6B-8C77-2A5E9D3B7F41"
+                       Win64="yes">
+              <CreateFolder>
+                <util:PermissionEx User="Users"
+                                   GenericRead="yes"
+                                   GenericExecute="yes"
+                                   Synchronize="yes" />
+              </CreateFolder>
+              <RegistryValue Root="HKLM"
+                             Key="Software\WinWallpaperPush"
+                             Name="SecureDir"
+                             Type="integer"
+                             Value="1"
+                             KeyPath="yes" />
+            </Component>
+          </Directory>
+
+        </Directory>
+      </Directory>
+
+      <!-- 开始菜单文件夹：显示窗口 / 文字控制台 -->
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="Win 壁纸推送" />
+      </Directory>
+
+    </Directory>
+
+    <!-- ============================================================
+         开机自启（所有用户登录时启动，运行在各自的会话里）
+         ============================================================ -->
+    <Component Id="CmpRunKey" Guid="C6CC5877-F428-4084-A6A6-7324AD3C19DF"
+               Win64="yes" Directory="INSTALLFOLDER">
+      <RegistryValue Root="HKLM"
+                     Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                     Name="WinWallpaperPushAgent"
+                     Type="string"
+                     Value="&quot;[INSTALLFOLDER]WallpaperAgent.exe&quot; --silent"
+                     KeyPath="yes" />
+    </Component>
+
+    <!-- ============================================================
+         功能
+         ============================================================ -->
+    <Feature Id="MainFeature"
+             Title="Win 壁纸推送 被控端"
+             Level="1"
+             Absent="disallow"
+             Description="被控端主程序、开机自启项、防火墙规则、开始菜单入口与默认配置">
+      <ComponentRef Id="CmpAgentExe" />
+      <ComponentRef Id="CmpConsole" />
+      <ComponentRef Id="CmpReadme" />
+      <ComponentRef Id="CmpConfig" />
+      <ComponentRef Id="CmpSecureDir" />
+      <ComponentRef Id="CmpRunKey" />
+    </Feature>
+
+    <!-- ============================================================
+         安装 / 卸载前先结束正在运行的被控端
+
+         Directory 必须是目录表里真实存在的目录（WiX 会校验符号），
+         所以这里用 INSTALLFOLDER 作为工作目录，taskkill 走绝对路径。
+         时序放在 InstallFiles 之前：那时文件夹已由 CreateFolders 建好，
+         而文件还没开始替换 —— 正好是解掉文件占用的时机。
+         ============================================================ -->
+    <CustomAction Id="CA_KillAgent"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[SystemFolder]taskkill.exe&quot; /IM WallpaperAgent.exe /F /T"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CA_KillAgent" Before="InstallFiles" />
+    </InstallExecuteSequence>
+
+  </Product>
+</Wix>

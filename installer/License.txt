@@ -1,0 +1,26 @@
+Win 壁纸推送 被控端 —— 最终用户许可协议与部署说明
+
+1. 用途
+   本软件用于在您自己拥有、或已获得明确授权的计算机上，接收局域网广播
+   并更换桌面壁纸。
+
+2. 功能范围
+   本软件只执行「更换桌面壁纸」这一项操作。不包含屏幕查看、键盘鼠标控制、
+   文件传输、进程管理、键盘记录或任何形式的数据采集与回传功能。
+
+3. 本机改动清单
+   安装后会在本机写入以下内容：
+
+     程序文件      C:\Program Files\WinWallpaperPush\
+     机器级配置    C:\ProgramData\WinWallpaperPush\agent_config.json
+     开机自启项    HKLM\Software\Microsoft\Windows\CurrentVersion\Run
+                   名称 WinWallpaperPushAgent
+     防火墙规则    Win Wallpaper Push Agent (UDP 38571)
+
+   程序文件、自启项与防火墙规则在卸载时由安装程序自动移除。
+
+4. 授权要求
+   请勿将本软件部署到未经授权的计算机。批量部署前应取得设备所有者同意。
+
+5. 免责声明
+   本软件按「现状」提供，不附带任何明示或暗示的担保。

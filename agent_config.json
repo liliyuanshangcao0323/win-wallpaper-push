@@ -1,0 +1,17 @@
+{
+  "udp_port": 38571,
+  "style": "填充",
+  "keep": 10,
+  "wallpaper_dir": "",
+  "silent": false,
+  "retry": 3,
+  "hello_interval": 60.0,
+  "log_file": "",
+  "log_max_kb": 512,
+  "toast_enabled": true,
+  "toast_module_path": "",
+  "toast_min_interval": 1.0,
+  "toast_auto_install": true,
+  "toast_app_name": "IT 运维通知",
+  "allow_remote_app_name": true
+}

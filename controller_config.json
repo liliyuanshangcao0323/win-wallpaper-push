@@ -1,0 +1,13 @@
+{
+  "udp_port": 39411,
+  "tcp_port": 38572,
+  "reply_port": 38573,
+  "style": "填充",
+  "targets": [],
+  "sweep": true,
+  "auto_scan": 30.0,
+  "last_dir": "",
+  "last_file": "",
+  "win_w": 1180,
+  "win_h": 780
+}

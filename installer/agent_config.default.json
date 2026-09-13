@@ -1,0 +1,9 @@
+{
+  "udp_port": 38571,
+  "style": "填充",
+  "keep": 10,
+  "wallpaper_dir": "",
+  "silent": true,
+  "retry": 3,
+  "hello_interval": 60
+}
