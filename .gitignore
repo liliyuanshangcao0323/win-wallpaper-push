@@ -159,3 +159,4 @@ installer/*.rtf
 tools/
 .build/
 dist/
+.tools/
