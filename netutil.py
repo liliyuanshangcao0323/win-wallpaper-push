@@ -558,16 +558,111 @@ def arp_neighbors() -> list[str]:
     return out
 
 
+def parse_target_spec(text: str, max_sweep: int = 4094) -> tuple[list[str], list[str], list[str]]:
+    """把用户填的「额外网段 / 地址」解析成 (发送目标, 逐台探测地址, 说明)。
+
+    为什么要这个：以前这里只认**广播地址**（例如 192.168.2.255），想"指定一个网段"
+    （手上只有 10.127.112.0/24 这种写法）就没法用。现在四种写法都认：
+
+      10.127.112.0/24               网段 → 发定向广播 10.127.112.255，并逐台探测 254 个地址
+      10.127.112.255                单个地址 → 直接发给它（广播地址就是这么发的），并顺带扫这个 /24
+      10.127.112.10                 单台机器 → 单播给它，也作为探测目标
+      10.127.112.1-10.127.112.60    地址范围 → 逐个单播 / 探测
+
+    超过 max_sweep 的大网段只取前 max_sweep 个地址（说明里会写清楚），
+    免得手滑填个 /8 把网络打爆。
+    """
+    send: list[str] = []
+    hosts: list[str] = []
+    notes: list[str] = []
+
+    def add_send(addr: str) -> None:
+        if addr and addr not in send:
+            send.append(addr)
+
+    def add_host(addr: str) -> None:
+        if addr and addr not in hosts and len(hosts) < max_sweep:
+            hosts.append(addr)
+
+    for piece in re.split(r"[,;\s]+", str(text or "")):
+        part = piece.strip()
+        if not part:
+            continue
+
+        # ① 网段：a.b.c.d/n
+        if "/" in part:
+            try:
+                net = ipaddress.IPv4Network(part, strict=False)
+            except ValueError:
+                notes.append(f"「{part}」不是合法的网段写法（例如 10.127.112.0/24），已忽略")
+                continue
+            add_send(str(net.broadcast_address))
+            total = max(0, net.num_addresses - 2)
+            taken = 0
+            for h in net.hosts():
+                if taken >= max_sweep:
+                    break
+                add_host(str(h))
+                taken += 1
+            if total > taken:
+                notes.append(f"{net} 太大（{total} 个地址），只逐台探测前 {taken} 个，"
+                             f"其余靠定向广播 {net.broadcast_address}")
+            else:
+                notes.append(f"{net} → 定向广播 {net.broadcast_address}，"
+                             f"逐台探测 {taken} 个地址")
+            continue
+
+        # ② 地址范围：a-b
+        m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s*-\s*(\d+\.\d+\.\d+\.\d+)$", part)
+        if m:
+            try:
+                lo = int(ipaddress.IPv4Address(m.group(1)))
+                hi = int(ipaddress.IPv4Address(m.group(2)))
+            except ValueError:
+                notes.append(f"「{part}」不是合法的地址范围，已忽略")
+                continue
+            if hi < lo:
+                lo, hi = hi, lo
+            count = min(hi - lo + 1, max_sweep)
+            for v in range(lo, lo + count):
+                add_host(str(ipaddress.IPv4Address(v)))
+            notes.append(f"{part} → 逐台探测 {count} 个地址")
+            continue
+
+        # ③ 单个地址：直接发给它（.255 就是广播地址，.0 多半是网段号）
+        try:
+            addr = ipaddress.IPv4Address(part)
+        except ValueError:
+            notes.append(f"「{part}」不是合法的 IP / 网段，已忽略")
+            continue
+        add_send(str(addr))
+        if str(addr).endswith((".255", ".0")):
+            net = ipaddress.IPv4Network(f"{addr}/24", strict=False)
+            taken = 0
+            for h in net.hosts():
+                if taken >= max_sweep:
+                    break
+                add_host(str(h))
+                taken += 1
+            notes.append(f"{part}（像广播/网段地址）→ 顺带逐台探测 {net} 的 {taken} 个地址")
+        else:
+            add_host(str(addr))
+            notes.append(f"{part} → 单播给它，并作为探测目标")
+    return send, hosts, notes
+
+
 def sweep_hosts(adapters: list[Adapter] | None = None,
-                max_hosts: int = 1022,
-                include_arp: bool = True) -> tuple[list[str], list[str]]:
+                max_hosts: int = 4094,
+                include_arp: bool = True,
+                extra: list[str] | None = None) -> tuple[list[str], list[str]]:
     """算出「逐台单播探测」要发的地址列表。
 
     返回 (地址列表, 说明列表)。广播在不少交换机 / AP（客户端隔离）上是被拦掉的，
     这时挨个单播一发就能把设备找回来 —— 被控端对单播 ping 一样会应答。
 
-    网段太大（例如 /16，6 万多台）时不会全扫，只扫本机所在的那个 /24，
-    其余交给定向广播和 ARP 名单。
+    网段太大（例如 /16，6 万多台）时不会全扫：只扫本机所在的那个 /24，
+    其余交给定向广播和 ARP 名单；**用户手工指定的网段（extra）永远会扫**
+    （同样受 max_hosts 约束），所以"有线那个网段扫不全"可以自己补上。
     """
     ads = adapters if adapters is not None else list_adapters()
     hosts: list[str] = []
@@ -578,7 +673,7 @@ def sweep_hosts(adapters: list[Adapter] | None = None,
     mine = set(local_ipv4_list())
 
     def add(ip: str) -> None:
-        if ip not in hosts and ip not in mine:
+        if ip not in hosts and ip not in mine and len(hosts) < max_hosts:
             hosts.append(ip)
 
     for ad in ads:
@@ -595,13 +690,23 @@ def sweep_hosts(adapters: list[Adapter] | None = None,
                 add(str(h))
             notes.append(
                 f"{ad.kind_name} {ad.ip}/{ad.prefix} 网段过大（{ad.host_count} 台），"
-                f"只扫本机所在 {small} 这 254 个地址，其余靠定向广播 "
-                f"{ad.broadcast}"
+                f"只扫本机所在 {small} 这 254 个地址；要扫别的网段就填进"
+                f"「额外网段」里（例如 10.127.112.0/24）"
             )
 
+    if extra:
+        added = 0
+        for ip in extra:
+            before = len(hosts)
+            add(ip)
+            if len(hosts) > before:
+                added += 1
+        if added:
+            notes.append(f"手工指定的网段/地址补充 {added} 个探测目标")
+
     if include_arp:
-        extra = arp_neighbors()
-        new = [ip for ip in extra if ip not in hosts]
+        arp = arp_neighbors()
+        new = [ip for ip in arp if ip not in hosts]
         for ip in new:
             add(ip)
         if new:
@@ -843,14 +948,42 @@ def attach_parent_console() -> bool:
         return False
 
 
+# 最近一次 load_json 失败的原因（空串 = 没出问题）。
+# 为什么要留这个：以前配置文件读不出来（例如存成了「UTF-8 带 BOM」）会**静默**
+# 退回默认值，然后程序把默认值又写回文件 —— 用户那边看到的就是"我明明改了配置，
+# 一点作用都没有，还被我改的丢了"。现在把原因记下来，界面/命令行能提示一句。
+LAST_JSON_ERROR = ""
+
+
 def load_json(path: str) -> dict:
+    """读 JSON 配置。
+
+    用 utf-8-sig：既认普通 UTF-8，也认**带 BOM** 的 UTF-8。
+    记事本「UTF-8」选项和 Windows PowerShell 5.1 的 `Set-Content -Encoding utf8`
+    都会写出 BOM，而带 BOM 的文件用 encoding="utf-8" 读会直接抛
+    `Unexpected UTF-8 BOM` —— 那正是上面那种"配置改了不生效"的成因。
+    """
+    global LAST_JSON_ERROR
     import json
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
+    if not os.path.exists(path):
+        LAST_JSON_ERROR = ""
         return {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        LAST_JSON_ERROR = ""
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        LAST_JSON_ERROR = f"{path}：{e}"
+        return {}
+
+
+def json_config_warning() -> str:
+    """配置文件读取失败时的一句话（没问题就返回空串）。"""
+    if not LAST_JSON_ERROR:
+        return ""
+    return ("配置文件读不出来，这次用的是默认设置（你原来的设置没被读进来）："
+            + LAST_JSON_ERROR)
 
 
 def save_json(path: str, obj: dict) -> None:

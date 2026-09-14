@@ -145,7 +145,13 @@ def main() -> int:
             time.sleep(0.2)
         online = ctrl.online_devices()
         detail = "；".join(f"{d.get('ip')} / {d.get('host')}" for _k, d in online) or "（无）"
-        check(len(online) == 1, "扫描到在线被控端，且多网卡按计算机名合并为 1 台", detail)
+        # 不能断言"只有 1 台"：这是真的在扫局域网，别人机器上的被控端也会被发现
+        # （改进探测范围之后实测就多扫到过一台，那条断言因此挂过一次）
+        import socket as _sock
+
+        mine = [d for _k, d in online if d.get("host") == _sock.gethostname()]
+        check(bool(mine), "扫描到本机被控端（多网卡按计算机名合并）",
+              f"共 {len(online)} 台：{detail}")
 
         print("\n[5] 广播推送壁纸")
         task = ctrl.push(img_path, "填充")

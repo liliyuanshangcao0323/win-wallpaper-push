@@ -180,6 +180,67 @@ def test_sweep() -> None:
           "；".join(n for n in notes3 if "ARP" in n) or "（本机 ARP 表为空，正常）")
 
 
+# ---------------------------------------------------------------- 3b. 指定网段
+
+def test_target_spec() -> None:
+    """用户填「额外网段」：以前只认广播地址，现在 CIDR / 范围 / 单机都认。"""
+    print("\n[3b] 指定网段（额外网段解析）")
+
+    send, hosts, notes = N.parse_target_spec("10.127.112.0/24")
+    check(send == ["10.127.112.255"], "10.127.112.0/24 → 定向广播 10.127.112.255",
+          "，".join(send))
+    check(len(hosts) == 254 and hosts[0] == "10.127.112.1" and hosts[-1] == "10.127.112.254",
+          "同一个网段会逐台探测 254 个地址", f"{len(hosts)} 个：{hosts[:2]}…{hosts[-1:]}")
+
+    send2, hosts2, _n2 = N.parse_target_spec("10.127.112.255")
+    check(send2 == ["10.127.112.255"] and len(hosts2) == 254,
+          "直接填广播地址也能用（顺带扫这一整个 /24）", f"{send2} / {len(hosts2)} 个")
+
+    send3, hosts3, _n3 = N.parse_target_spec("10.127.112.77")
+    check(send3 == ["10.127.112.77"] and hosts3 == ["10.127.112.77"],
+          "填单台机器 → 只单播给它", f"{send3} / {hosts3}")
+
+    _s4, hosts4, _n4 = N.parse_target_spec("10.127.112.1-10.127.112.5")
+    check(len(hosts4) == 5, "地址范围会展开成 5 个地址", str(hosts4))
+
+    send5, hosts5, notes5 = N.parse_target_spec("10.0.0.0/16")
+    check(send5 == ["10.0.255.255"] and len(hosts5) == 4094,
+          "/16 这种大网段只取前 4094 个（不会把网络打爆）", f"{len(hosts5)} 个")
+    check(any("太大" in n for n in notes5), "并且会说明没扫全", "；".join(notes5))
+
+    send6, hosts6, notes6 = N.parse_target_spec("乱写的东西 192.168.5.0/24")
+    check(send6 == ["192.168.5.255"] and len(hosts6) == 254,
+          "非法写法被忽略、合法的照常用", "；".join(notes6))
+    check(any("忽略" in n for n in notes6), "非法写法会在日志里说明原因")
+
+    multi_send, multi_hosts, _n7 = N.parse_target_spec("10.127.112.0/24 192.168.2.0/24")
+    check(len(multi_send) == 2 and len(multi_hosts) == 508,
+          "多个网段可以一起填（空格/逗号分隔）", f"{multi_send} / {len(multi_hosts)} 个")
+
+    # 指定网段要真的进到探测列表里（这才是"扫得到"的关键）
+    ads = [wired("10.13.3.214", 16)]          # 模拟控制端那张 /16 的网卡
+    hosts_all, notes_all = N.sweep_hosts(ads, include_arp=False,
+                                         extra=["10.127.112.1", "10.127.112.2"])
+    check("10.127.112.1" in hosts_all and "10.127.112.2" in hosts_all,
+          "手工指定的地址会进到逐台探测列表里（大网段也照扫）",
+          f"共 {len(hosts_all)} 个")
+    check(any("手工指定" in n for n in notes_all), "日志里会写明补了多少个目标",
+          "；".join(n for n in notes_all if "手工" in n))
+
+    # 用户问过："我有一台是 .98，探测列表里没有，是不是你设置了范围"
+    # —— 一个 /24 就是整段 .1~.254，任何一台都在里面，不该有例外
+    lan = wired("10.127.112.153", 24)
+    hosts24, _n24 = N.sweep_hosts([lan], include_arp=False)
+    check(len(hosts24) == 254, "/24 网段会探测 254 个地址（不是抽样的子集）",
+          f"{len(hosts24)} 个")
+    check(all(f"10.127.112.{i}" in hosts24 for i in (1, 98, 150, 254)),
+          "网段里任意一台都在探测列表里（含 .98）",
+          f"范围 {hosts24[0]} … {hosts24[-1]}")
+    spec_send, spec_hosts24, _n = N.parse_target_spec("10.127.112.0/24")
+    check(f"10.127.112.98" in spec_hosts24,
+          "手填 10.127.112.0/24 时也会把 .98 算进去", f"{len(spec_hosts24)} 个")
+
+
 # ---------------------------------------------------------------- 4. 发送路由
 
 def test_egress() -> None:
@@ -291,9 +352,12 @@ def test_agent_answers_unicast() -> None:
 
 def test_end_to_end() -> None:
     print("\n[6] 端到端：主动报到 + 深度扫描")
+    import socket as _socket
+
     from agent import AgentCore
     from controller import ControllerCore
 
+    agent_host = _socket.gethostname()
     with tempfile.TemporaryDirectory(prefix="wpp_scan_") as tmp:
         agent = AgentCore({
             "udp_port": P.UDP_PORT, "style": "填充", "keep": 1,
@@ -327,10 +391,15 @@ def test_end_to_end() -> None:
             deadline = time.time() + 6
             while time.time() < deadline and not ctrl.online_devices():
                 time.sleep(0.2)
-            check(len(ctrl.online_devices()) == 1,
-                  "深度扫描找到 1 台设备（多网卡按计算机名合并）",
-                  "；".join(f"{d.get('ip')} {d.get('host')}"
-                            for _k, d in ctrl.online_devices()) or "（无）")
+            # 注意：**不能断言"只有 1 台"** —— 这套自测会真的扫整个局域网，
+            # 别人机器上跑着的被控端（甚至别人的控制端）都可能被扫到；
+            # 之前就因为这个假设挂过一次（顺带发现新探测确实多找到了一台）。
+            ours = [d for _k, d in ctrl.online_devices()
+                    if d.get("host") == agent_host]
+            check(bool(ours), "深度扫描找到了本机的被控端（多网卡按计算机名合并）",
+                  f"共发现 {len(ctrl.online_devices())} 台；"
+                  + "；".join(f"{d.get('ip')} {d.get('host')}"
+                              for _k, d in ctrl.online_devices()) or "（无）")
 
             ctrl.scan(deep=False)
             check(ctrl.last_sweep_count == 0, "关掉深度扫描时只广播，不发单播探测")
@@ -338,10 +407,110 @@ def test_end_to_end() -> None:
             info = next((m for m in ctrl_logs if "单播探测范围" in m), "")
             check(bool(info), "扫描范围会写进日志（排查时看得见）",
                   info or "；".join(ctrl_logs[-4:]))
+
+            print("\n[8] 推送时会不会单独发给已知设备（设备多时广播总有漏的）")
+            # 关键回归：广播会被交换机/AP 拦掉，光广播"谁在线谁改"实测会漏机器。
+            # 现在除了广播，还会把同一条公告**逐个单播给已知设备**，并对没回执的补发。
+            sent_to: list[str] = []
+            real_send = ctrl._send_packet
+
+            def spy(raw, targets):
+                sent_to.extend(targets)
+                return real_send(raw, targets)
+
+            ctrl._send_packet = spy            # type: ignore[assignment]
+            try:
+                ping = P.make("noop", ts=time.time())   # 被控端不认识这个消息，不会回执
+                ctrl.announce(ping, "task-loopback-test", rounds=3, gap=0.6,
+                              label="测试")
+                known = ctrl.known_ips()
+                check(bool(known), "能算出「已知设备」列表", "，".join(known) or "（空）")
+                hit = [ip for ip in known if ip in sent_to]
+                check(bool(hit), "公告会直接单播给已知设备（不只靠广播）",
+                      f"单播目标 {sorted(set(sent_to))[:6]}")
+                first = len(sent_to)
+                time.sleep(2.0)
+                check(len(sent_to) > first,
+                      "没回执的机器会被自动补发（第 2 轮单播重发）",
+                      f"补发前 {first} 个包 → 补发后 {len(sent_to)} 个包")
+                check(any("第 2 轮补发" in m for m in ctrl_logs),
+                      "补发这件事会写进日志",
+                      next((m for m in ctrl_logs if "补发" in m), "（没有）"))
+
+                # 补发完还不回执的机器：要点名 + 探一次"它到底还在不在"
+                ctrl_logs.clear()
+                ctrl._touch_device("10.127.112.99", "PC-LOST", "user", "", 0)
+                ping2 = P.make("noop", ts=time.time())
+                ctrl.announce(ping2, "task-lost-test", rounds=2, gap=0.5,
+                              label="掉线测试")
+                deadline = time.time() + 12
+                while time.time() < deadline:
+                    if any("没回执" in m for m in ctrl_logs):
+                        break
+                    time.sleep(0.3)
+                joined = "；".join(ctrl_logs)
+                check("10.127.112.99" in joined and "没回执" in joined,
+                      "没回执的机器会被点名列出", joined[:100] or "（没有）")
+                # 探测要等 4 秒才有结论，这里再等一会儿
+                deadline = time.time() + 12
+                while time.time() < deadline:
+                    if any("不回应" in m for m in ctrl_logs):
+                        break
+                    time.sleep(0.3)
+                check("连扫描也不回应" in joined or any("不回应" in m for m in ctrl_logs),
+                      "会再探一次并给出结论：这台的网络根本不通",
+                      next((m for m in ctrl_logs if "不回应" in m), "（没有）"))
+            finally:
+                ctrl._send_packet = real_send   # type: ignore[assignment]
         finally:
             agent.stop()
             ctrl.stop()
             time.sleep(0.2)
+
+
+# ---------------------------------------------------------------- 9. 设备列表计数
+
+def test_device_list_keys() -> None:
+    """设备列表按 IP 计数：**同名机器必须分开显示**。
+
+    回归用例（用户实际遇到）：客户机是克隆镜像 / 同批装的，计算机名经常一样；
+    老版本按计算机名归并设备，于是 50 台在列表里被合并成 1 行 ——
+    界面看起来"只发现一台"，但日志里一堆。
+    """
+    print("\n[9] 设备列表计数（同名机器要分开显示）")
+    from controller import ControllerCore
+
+    def new_core() -> ControllerCore:
+        c = ControllerCore({"udp_port": 39921, "tcp_port": 39922,
+                            "reply_port": 39923, "targets": []})
+        c.log = lambda m, l="info": None
+        return c
+
+    ctrl = new_core()
+    for i in range(1, 51):
+        ctrl._touch_device(f"10.127.112.{i}", "PC-CLONE", "user", "", 0)
+    check(len(ctrl.devices) == 50, "50 台同名机器会显示成 50 行（以前合成 1 行）",
+          f"{len(ctrl.devices)} 行")
+    check(len(ctrl.online_devices()) == 50, "在线台数也是 50（顶部徽标不再虚低）",
+          f"{len(ctrl.online_devices())} 台")
+
+    # 回执也要按机器分开统计：有机器没回执时能点出名字
+    with ctrl._dev_lock:
+        ctrl._acks["t"] = {}
+        for i in range(1, 51):
+            ctrl._acks["t"][f"10.127.112.{i}"] = (i % 7 != 0, "", time.time(),
+                                                  f"10.127.112.{i}")
+    ok, fail, pending = ctrl.ack_summary("t")
+    check((ok, fail, pending) == (43, 7, 0),
+          "回执按机器统计（成功 43 · 失败 7）", f"{ok}/{fail}/{pending}")
+
+    # 本机自测那种情况仍要合成一条（127.0.0.1 + 局域网 IP 是同一台机器）
+    ctrl2 = new_core()
+    ctrl2._touch_device("10.13.3.214", "DESKTOP-X", "li", "", 0)
+    ctrl2._touch_device("127.0.0.1", "DESKTOP-X", "li", "", 0)
+    check(len(ctrl2.devices) == 1,
+          "同一台机器从 127.0.0.1 和局域网 IP 各报一次仍算一台",
+          "；".join(f"{d.get('ip')} {d.get('host')}" for d in ctrl2.devices.values()))
 
 
 def main() -> int:
@@ -351,9 +520,11 @@ def main() -> int:
     test_adapters()
     test_targets()
     test_sweep()
+    test_target_spec()
     test_egress()
     test_agent_answers_unicast()
     test_end_to_end()
+    test_device_list_keys()
 
     passed = sum(1 for ok, _ in RESULTS if ok)
     failed = len(RESULTS) - passed

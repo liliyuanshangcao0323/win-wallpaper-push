@@ -44,6 +44,8 @@ python -m PyInstaller --noconfirm --clean --onefile --noconsole ^
     --hidden-import PIL._tkinter_finder ^
     --hidden-import toastui ^
     --hidden-import toastspec ^
+    --hidden-import sshui ^
+    --hidden-import sshcmd ^
     --hidden-import ui ^
     --hidden-import netutil ^
     --hidden-import protocol ^

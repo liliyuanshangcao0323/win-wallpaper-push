@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import os
 import queue
 import shutil
@@ -405,6 +406,28 @@ class AgentCore:
                         self._seen_ping[nonce] = now
                 self._reply_pong(msg, addr)
 
+    def _egress_for_peer(self, peer_ip: str):
+        """挑一个「和目标同网段」的发送套接字，用来回包。
+
+        为什么必须有这个：回执以前走的是绑在 0.0.0.0 的主 socket，
+        **出口由 Windows 路由表决定** —— 一台同时插着网线和无线的客户机
+        （现场很常见），回包可能从另一张网卡出去：源地址变成别的网段，
+        控制端看到的就不是它的局域网地址，甚至直接收不到。表现就是
+        「这台机器明明在线，却一直没有回执、壁纸也不变」。
+        这里改成：对端地址落在哪张网卡的网段里，就用那张网卡的套接字回。
+        """
+        fallback = self._sock
+        try:
+            addr = ipaddress.IPv4Address(str(peer_ip))
+            for ad in N.list_adapters():
+                if ad.usable and addr in ad.network and ad.ip in self._egress:
+                    return self._egress[ad.ip]
+        except Exception:
+            # 挑发送通道只是个优化：**绝不能**因为这里出错就让收包/回执整个挂掉
+            # （之前漏了 import ipaddress，NameError 直接把接收线程打断了）
+            pass
+        return fallback
+
     def _reply_pong(self, msg: dict, addr) -> None:
         """回应控制端的在线扫描。"""
         out = P.make(
@@ -420,7 +443,8 @@ class AgentCore:
         # 优先发到控制端专门收单播的回执端口，收不到再退回源端口
         port = int(msg.get("reply_port") or addr[1])
         try:
-            self._sock.sendto(P.dumps(out), (addr[0], port))
+            # 从「和它同网段」的那张网卡回：多网卡机器才不会从错的那张发包
+            self._egress_for_peer(addr[0]).sendto(P.dumps(out), (addr[0], port))
             self.log(f"已回应在线扫描（{addr[0]}）", "dim")
         except OSError as e:
             self.log(f"回应扫描失败：{e}", "err")
@@ -815,11 +839,11 @@ class AgentCore:
             ts=time.time(),
         )
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.sendto(P.dumps(out), (ip, int(port)))
-            finally:
-                s.close()
+            # 从「和控制端同网段」的那张网卡把回执发出去。
+            # 以前这里新建一个未绑定的 socket，出口全靠路由表 —— 多网卡机器
+            # （网线 + 无线同时插着）可能从错的那张网卡回，控制端就收不到回执，
+            # 表现是「在线但一直待确认、壁纸也没变」。
+            self._egress_for_peer(ip).sendto(P.dumps(out), (ip, int(port)))
         except OSError:
             pass  # 控制端可能已经关了，回报失败不算错误
 

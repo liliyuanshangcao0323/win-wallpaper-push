@@ -158,6 +158,34 @@ def _safe_text(w) -> str:
         return ""
 
 
+def _value(w) -> str:
+    """取输入框 / 下拉框里的当前值。
+
+    为什么不能直接用 _safe_text：TEntry / TCombobox 没有 -text 选项，
+    cget("text") 永远返回空串 —— 用它找"私钥路径是不是填好了"会永远找不到。
+    """
+    try:
+        if w.winfo_class() in ("TEntry", "Entry", "TCombobox", "Combobox"):
+            return str(w.get())
+    except Exception:
+        pass
+    return _safe_text(w)
+
+
+def is_log_text(w) -> bool:
+    """这个 Text 是不是「日志面板」。
+
+    日志面板一律是只读的（ui.LogPane 建出来就是 state=disabled），
+    而命令输入框之类的 Text 是可编辑的 —— 靠这一点区分。
+    以前这里写的是"只要有一个可见的 Text 就算日志展开了"，
+    后来「远程命令」页加了**可见的命令输入框**，那条判断就误报了。
+    """
+    try:
+        return w.winfo_class() == "Text" and str(w.cget("state")) == "disabled"
+    except Exception:
+        return False
+
+
 def find_widgets(win, cls_names: tuple[str, ...]) -> list:
     out: list = []
 
@@ -377,7 +405,8 @@ def main() -> int:
             # 先记下"刚建出来时"的状态：下面要按一堆按钮，其中「运行日志」
             # 会把日志展开，之后再查就查不出"默认是不是收起"了。
             log_open_at_start = any(
-                x.winfo_ismapped() for x in find_widgets(self, ("Text",)))
+                is_log_text(x) and x.winfo_ismapped()
+                for x in find_widgets(self, ("Text",)))
 
             # 回调自检：把所有复选框和「重新检测网卡」按一遍，
             # 免得这些新加的按钮里藏着拼写错误，要点下去才炸
@@ -386,16 +415,19 @@ def main() -> int:
                 if line.startswith("[FAIL]"):
                     layout_failures.append(line)
 
-            # 页签自检：控制端现在是「壁纸 / 通知 / 设置」三个页面，
+            # 页签自检：控制端现在是「壁纸 / 通知 / 远程命令 / 设置」四个页面，
             # 一个都不能是空的、点不开的，而且内容必须看得到
             # （要么整页放得下，要么能滚动到 —— 不允许有控件被裁掉）。
             books = find_notebooks(self)
             for nb in books:
                 tabs = list(nb.tabs())
-                print(f"  [PASS] 找到页签 {len(tabs)} 个："
-                      + "、".join(nb.tab(t, "text").strip() for t in tabs))
+                names = [nb.tab(t, "text").strip() for t in tabs]
+                print(f"  [PASS] 找到页签 {len(tabs)} 个：" + "、".join(names))
                 if len(tabs) < 2:
-                    layout_failures.append("页签数量不对（控制端应该有壁纸/通知/设置三个页）")
+                    layout_failures.append("页签数量不对（控制端应该有壁纸/通知/远程命令/设置四个页）")
+                for need in ("壁纸", "通知", "远程命令", "设置"):
+                    if need not in names:
+                        layout_failures.append(f"少了「{need}」页签（现有：{'、'.join(names)}）")
                 before_popups = count_toplevels(self)
                 for idx, t in enumerate(tabs):
                     try:
@@ -490,6 +522,82 @@ def main() -> int:
                       f"（按钮 y={by}，窗口 {win_top}~{win_bottom}）")
                 if not ok_pin:
                     layout_failures.append("发送按钮被内容挤出可见区域")
+
+            # ================= 「远程命令」页自检
+            # 这一页是新加的：在几十台机器上跑 SSH 命令，界面里填错一个字段
+            # 就可能"一条都没发出去"，所以把关键控件都点名检查一遍。
+            if books:
+                nb_ssh = books[0]
+                for t in nb_ssh.tabs():
+                    if nb_ssh.tab(t, "text").strip() == "远程命令":
+                        nb_ssh.select(t)
+                self.update_idletasks()
+                self.update()
+
+                # ① 命令框里要有内容（默认 hostname），而且是可编辑的多行框
+                cmds = ""
+                for w in find_widgets(self, ("Text",)):
+                    try:
+                        if not (w.winfo_ismapped() and w.winfo_width() > 80):
+                            continue
+                        body = w.get("1.0", "end").strip()
+                    except Exception:
+                        continue
+                    if body and "hostname" in body.lower():
+                        cmds = body
+                        break
+                ok_cmd = bool(cmds)
+                print(f"  [{'PASS' if ok_cmd else 'FAIL'}] 远程命令页有命令输入框且预填了命令"
+                      f"（内容：{cmds.splitlines()[0] if cmds else '空'}）")
+                if not ok_cmd:
+                    layout_failures.append("远程命令页的命令输入框没预填/找不到")
+
+                # ② 私钥路径默认值要能看见（就是用户给的原始命令里的那个路径）
+                keys = [e for e in find_widgets(self, ("TEntry", "Entry"))
+                        if "id_ed25519" in _value(e)]
+                print(f"  [{'PASS' if keys else 'FAIL'}] 私钥 -i 默认值在界面上"
+                      f"（{_value(keys[0])[:52] if keys else '没找到'}）")
+                if not keys:
+                    layout_failures.append("远程命令页没有私钥路径输入框/没有默认值")
+
+                # ③ 结果表：每台一行（IP / 状态 / 退出码 / 远端回显）
+                ok_tree2 = False
+                for tr in find_widgets(self, ("Treeview",)):
+                    try:
+                        if list(tr.cget("columns")) == ["ip", "state", "code", "evidence"]:
+                            ok_tree2 = True
+                    except Exception:
+                        pass
+                print(f"  [{'PASS' if ok_tree2 else 'FAIL'}] 远程命令页有每台设备的结果表")
+                if not ok_tree2:
+                    layout_failures.append("远程命令页缺少结果表（IP/状态/退出码/回显）")
+
+                # ④ 动作按钮要钉在可见区域（和「发送通知」同一个道理）
+                for label in ("发送到设备", "停止", "生成批处理", "导出结果"):
+                    btns = [b for b in find_widgets(self, ("TButton", "Button"))
+                            if label in _safe_text(b)]
+                    if not btns:
+                        layout_failures.append(f"远程命令页缺少「{label}」按钮")
+                        print(f"  [FAIL] 远程命令页缺少「{label}」按钮")
+                        continue
+                    b = btns[0]
+                    win_top = self.winfo_rooty()
+                    win_bottom = win_top + self.winfo_height()
+                    by = b.winfo_rooty()
+                    ok_b = b.winfo_ismapped() and win_top <= by <= win_bottom
+                    print(f"  [{'PASS' if ok_b else 'FAIL'}] 「{label}」钉在可见区域"
+                          f"（y={by}，窗口 {win_top}~{win_bottom}）")
+                    if not ok_b:
+                        layout_failures.append(f"远程命令页「{label}」被挤出可见区域")
+
+                # ⑤ 执行方式下拉：两种方式都能选（会话式 / 逐条独立）
+                modes = [c for c in find_widgets(self, ("TCombobox",))
+                         if "会话式" in _value(c)]
+                ok_mode = bool(modes) and len(modes[0].cget("values")) == 2
+                print(f"  [{'PASS' if ok_mode else 'FAIL'}] 执行方式下拉有 2 个选项"
+                      f"（{'/'.join(modes[0].cget('values'))[:44] if modes else '没找到'}）")
+                if not ok_mode:
+                    layout_failures.append("远程命令页的执行方式下拉不对")
 
             # 控制端专属的排版指标：设备列表是主体、日志默认收起、文字不被切
             if books:

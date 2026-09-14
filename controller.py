@@ -29,10 +29,11 @@ import uuid
 
 import netutil as N
 import protocol as P
+import sshcmd as SC
 import toastspec as TS
 
 APP_NAME = "Win壁纸推送 - 控制端"
-APP_VER = "1.2.0"
+APP_VER = "1.3.0"
 
 ONLINE_WINDOW = 90.0   # 多少秒内有回应算「在线」
 # 同一台设备隔这么久没动静又重新回应，就在日志里说一句「重新上线」。
@@ -49,6 +50,9 @@ DEFAULT_CFG = {
     "auto_scan": 30.0,    # 秒；后台每隔这么久自动重扫一次，0 = 关闭
     "last_dir": "",
     "last_file": "",
+    # 远程命令（SSH）那一页的设置。默认值就是用户给的原始命令那套
+    # （同一批机器、同一把私钥），打开界面就能直接用。
+    "ssh": SC.defaults(),
 }
 
 
@@ -66,6 +70,10 @@ class ControllerCore:
         self.extra_targets = list(cfg.get("targets") or [])
         self.sweep = bool(cfg.get("sweep", True))
         self.auto_scan = max(0.0, float(cfg.get("auto_scan") or 0))
+        # 在线判定窗口：远程命令页要用它区分「在线设备」和「全部已发现」
+        self.online_window = ONLINE_WINDOW
+        # 远程命令（SSH）设置：界面和命令行都从这里取
+        self.ssh_cfg = SC.normalize_cfg(cfg.get("ssh"))
 
         self.log = log or (lambda msg, level="info": None)
         self.on_event = on_event or (lambda kind, data: None)
@@ -82,6 +90,10 @@ class ControllerCore:
         self.devices: dict[str, dict] = {}       # ip -> 设备信息
         self._dev_lock = threading.Lock()
         self.targets: list[str] = []
+        # 用户手填的网段里要「逐台探测」的地址（由 parse_target_spec 算出来）
+        self.spec_hosts: list[str] = []
+        # 本机自己的地址（懒加载）：用来把"控制端自己"并成一条设备
+        self._self_ips: set[str] | None = None
         # 通知用的图片：{task: {资源名: 字节}}，被控端按需用 TCP 来拉
         self._toast_assets: dict[str, dict[str, bytes]] = {}
         self.last_toast_task = ""
@@ -112,6 +124,16 @@ class ControllerCore:
             self.log(f"回执端口 {self.reply_port} 绑定失败（{e}），改为在广播口收确认", "warn")
             self._reply_sock = None
 
+        # 收包缓冲加大：几十台机器会在同一两秒里一起回执（push 之后），
+        # 默认 64KB 的缓冲很容易溢出 —— 表现就是"在线但没回执"，而客户端其实发了。
+        for s in (self._sock, self._reply_sock):
+            if not s:
+                continue
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+            except OSError:
+                pass
+
         for s in (self._sock, self._reply_sock):
             if s:
                 threading.Thread(target=self._udp_loop, args=(s,), daemon=True).start()
@@ -130,9 +152,19 @@ class ControllerCore:
 
         有线、无线、虚拟网卡一个都不落下：只有把每张网卡的定向广播地址都
         发一遍，客户机在哪张网卡上都能收到。
+
+        「额外网段」支持四种写法（见 netutil.parse_target_spec）：
+        `10.127.112.0/24`、`10.127.112.255`、单台 IP、地址范围。
         """
         self.adapters = N.list_adapters()
-        self.targets = N.broadcast_targets(self.extra_targets, adapters=self.adapters)
+        # 手填的网段/地址：解析出「发到哪儿」和「逐台探测哪些地址」
+        spec_send, spec_hosts, spec_notes = N.parse_target_spec(
+            " ".join(self.extra_targets))
+        self.spec_hosts = spec_hosts
+        # 只把**解析出来的**地址当发送目标：以前这里会把手填的原始字符串
+        # 直接塞进目标列表，于是 `10.127.112.2-10.127.112.9` 这种范围写法
+        # 会被当成域名去解析（日志里一堆 getaddrinfo failed）
+        self.targets = N.broadcast_targets(spec_send, adapters=self.adapters)
         # 换发送套接字时和正在广播的线程（自动重扫 / 推送）串行，
         # 否则可能关掉它正要用的那个 socket
         with self._send_lock:
@@ -146,7 +178,19 @@ class ControllerCore:
         else:
             self.log("没检测到可用的局域网网卡（只剩回环 / 169.254 自动地址），"
                      "请检查网线或 WiFi 是否连通", "warn")
-        self.log("广播目标：" + "，".join(self.targets), "dim")
+        for ad in self.adapters:
+            if not ad.usable:
+                self.log(f"跳过网卡 {ad.ip or '（无地址）'}（{ad.title}）："
+                         f"{'已断开' if not ad.up else '不可用于局域网广播'}", "dim")
+        for note in spec_notes:
+            self.log("额外网段：" + note, "ok" if "忽略" not in note else "warn")
+        if self.extra_targets and not spec_send:
+            self.log("额外网段里没有「发送目标」（只有探测范围），"
+                     "广播仍走本机网段 —— 这些地址会逐台单播探测", "dim")
+        self.log(f"广播目标 {len(self.targets)} 个：" + "，".join(self.targets), "dim")
+        if not self.sweep:
+            self.log("深度扫描已关闭（设置页可打开）：只发广播，不逐台单播探测 —— "
+                     "交换机 / 无线 AP 拦广播时，设备会扫不全", "warn")
         return self.targets
 
     # ---------------------------------------------------------- 每张网卡一个发送通道
@@ -283,13 +327,19 @@ class ControllerCore:
             self.on_event("ack", {"ip": ip, "task": task, "ok": ok, "err": err})
 
     @staticmethod
-    def device_key(ip: str, host: str) -> str:
-        """设备唯一标识。
+    def device_key(ip: str, host: str = "") -> str:
+        """设备唯一标识 = **IP**。
 
-        优先用计算机名：同一台机器有多张网卡时（例如同时从 127.0.0.1 和
-        局域网地址回报），只有按名字归并才能算作一台，否则设备列表会翻倍。
+        以前是按计算机名归并的，本意是"同一台机器有多张网卡时只算一台"，
+        但克隆镜像 / 同批装机的客户机**经常同名** —— 结果 50 台机器在设备列表里
+        被合并成 1 行（用户实际遇到的问题：日志里几十台，列表里只有一个）。
+        改成按 IP：
+          * 同一个 IP 一定是一台机器；
+          * 同名不同 IP 就是不同的机器，分开显示、分开统计回执。
+        唯一例外：本机自测时被控端会同时从 127.0.0.1 和局域网 IP 各报一次，
+        这种情况在 `_touch_device` 里并成一条。
         """
-        return (host or "").strip().lower() or ip
+        return ip
 
     def _touch_device(self, ip, host, user, applied, count) -> str:
         """登记 / 刷新一台设备。
@@ -299,10 +349,28 @@ class ControllerCore:
         """
         key = self.device_key(ip, host)
         now = time.time()
+        # 本机自己的地址（127.x / Hyper-V 之类虚拟网卡 / 多张网卡）都算"自己"，
+        # 免得控制端把自己扫成好几台设备（现场就见过 172.25.16.1 出现在列表里，
+        # 那是控制端自己的 Hyper-V 虚拟网卡）
+        with self._dev_lock:
+            if self._self_ips is None:
+                try:
+                    self._self_ips = set(N.local_ipv4_list())
+                except Exception:
+                    self._self_ips = set()
+            self_ips = self._self_ips
+        is_self = ip in self_ips or ip.startswith("127.")
         with self._dev_lock:
             d = self.devices.get(key)
+            if d is None and is_self:
+                # 并到"本机"那一条（优先保留局域网地址那条）
+                for k, other in self.devices.items():
+                    if host and str(other.get("host") or "").lower() == host.lower():
+                        key = k
+                        d = other
+                        break
             if d is None:
-                # 之前可能只用 IP 建过条目，直接接管过来，不要留下孤儿行
+                # 之前可能用过别的 key，直接接管过来，不要留下孤儿行
                 d = self.devices.pop(ip, {}) if ip != key else {}
                 self.devices[key] = d
                 status = "new"
@@ -310,9 +378,10 @@ class ControllerCore:
                 status = "back" if now - d.get("last", 0) > REDISCOVER_QUIET else ""
             if host:
                 d["host"] = host
-            # 127.0.0.1 只用于本机自测，展示时优先用真实局域网地址
+            # 127.0.0.1 / 虚拟网卡只用于本机自测，展示时优先用真实局域网地址
             old_ip = d.get("ip") or ""
-            if not old_ip or (old_ip.startswith("127.") and not ip.startswith("127.")):
+            if not old_ip or ((old_ip.startswith("127.") or old_ip in self_ips)
+                              and not (ip.startswith("127.") or ip in self_ips)):
                 d["ip"] = ip
             if user:
                 d["user"] = user
@@ -330,7 +399,9 @@ class ControllerCore:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", self.tcp_port))
-        srv.listen(64)
+        # 设备多的时候会有几十台同时回连下壁纸：backlog 太小会直接拒掉一部分
+        # （客户端那头表现就是"下载失败"，而控制端看不出原因）
+        srv.listen(256)
         self._srv = srv
         while not self._stop.is_set():
             try:
@@ -393,6 +464,175 @@ class ControllerCore:
 
     # ---------------------------------------------------------- 广播
 
+    def _send_packet(self, raw: bytes, targets: list[str]) -> int:
+        """把一条消息发到一组地址（广播地址 / 单播地址都行），返回成功发出的次数。"""
+        sent = 0
+        if self._sock is None:
+            return 0
+        with self._send_lock:
+            for t in targets or ["255.255.255.255"]:
+                for s in self._egress_for(t):
+                    try:
+                        s.sendto(raw, (t, self.udp_port))
+                        sent += 1
+                    except OSError as e:
+                        self.log(f"发送到 {t} 失败：{e}", "err")
+        return sent
+
+    def known_ips(self) -> list[str]:
+        """已经发现过的设备地址（用来直接单播，绕开被拦掉的广播）。"""
+        with self._dev_lock:
+            return [str(d.get("ip") or k) for k, d in self.devices.items()]
+            # 注：不判在线，离线一会儿的机器也值得试一次（它可能刚回来）
+
+    def probe(self, ips: list[str], wait: float = 4.0) -> set[str]:
+        """对指定地址各发一次单播 ping，返回在 wait 秒内**回应过**的地址集合。
+
+        用途：推送之后排查"在线但没回执"。能回应的说明"双向网络通"，
+        那没回执多半是它压根没收到公告或者下载壁纸失败；连回应都没有的，
+        说明那条路不通（离线 / 防火墙 / 跨网段被挡）。
+        """
+        if not ips or self._sock is None:
+            return set()
+        before: dict[str, float] = {}
+        with self._dev_lock:
+            for ip in ips:
+                for k, d in self.devices.items():
+                    if str(d.get("ip") or k) == ip:
+                        before[ip] = float(d.get("last") or 0)
+                        break
+        nonce = uuid.uuid4().hex[:8]
+        msg = P.dumps(P.make(P.MSG_PING, nonce=nonce,
+                             reply_port=self.reply_port, ts=time.time()))
+        self._send_packet(msg, ips)
+        time.sleep(max(0.5, wait))
+        alive: set[str] = set()
+        with self._dev_lock:
+            for ip in ips:
+                for k, d in self.devices.items():
+                    if str(d.get("ip") or k) == ip:
+                        if float(d.get("last") or 0) > before.get(ip, 0):
+                            alive.add(ip)
+                        break
+        return alive
+
+    def announce(self, obj: dict, task: str, rounds: int = 4,
+                 gap: float = 5.0, label: str = "") -> None:
+        """广播一条公告，**并且直接单播给已知设备**，然后对没回执的机器补发。
+
+        为什么要这样（用户实际遇到的问题）：
+          * 广播会被交换机 / 无线 AP / VLAN 隔离拦掉，设备一多总有几台收不到；
+          * 光靠广播"谁在线就谁改"，实测里总有机器漏掉。
+        所以这里做三层：
+          1. 广播（多网卡 × 多发几遍）；
+          2. 对**已知设备逐个单播**同一份公告 —— 只要它还在线，单播一定送到；
+          3. 隔几秒查一次回执，谁没确认就单独再单播给它（最多 rounds 轮）。
+        """
+        if self._sock is None:
+            return
+        if not self.targets:
+            self.refresh_targets()
+
+        raw = P.dumps(obj)
+        # ① 广播（多发几遍抵消 UDP 丢包）
+        self._broadcast(obj, times=3, gap=0.25)
+
+        # ② 已知设备 + 手工指定网段里的地址，直接单播
+        known = self.known_ips()
+        direct = list(known)
+        for ip in self.spec_hosts[:1024]:
+            if ip not in direct:
+                direct.append(ip)
+        if direct:
+            sent = self._send_packet(raw, direct)
+            extra = len(direct) - len(known)
+            self.log(f"{label}额外单播 {len(direct)} 个地址"
+                     f"（{len(known)} 台已知设备"
+                     + (f" + 指定网段 {extra} 个" if extra else "")
+                     + f"），共发 {sent} 个包，绕开被拦的广播", "dim")
+
+        # ③ 谁没回执就补发
+        if rounds > 1 and direct:
+            def retry():
+                for rnd in range(2, rounds + 1):
+                    if self._stop.wait(gap):
+                        return
+                    with self._dev_lock:
+                        acks = dict(self._acks.get(task, {}))
+                        online = [str(d.get("ip") or k)
+                                  for k, d in self.devices.items()]
+                    # 回执是按「计算机名/IP」归并的 key 存的，值里第 4 个才是 IP
+                    done = {str(v[3]) for v in acks.values() if len(v) > 3}
+                    todo = [ip for ip in online if ip not in done]
+                    if not todo:
+                        self.log(f"{label}全部回执齐全（{len(done)} 台）", "ok")
+                        return
+                    self.log(f"{label}第 {rnd} 轮补发：{len(todo)} 台还没回执，"
+                             f"单独单播重发", "warn")
+                    self._send_packet(raw, todo[:1024])
+                # 补发完还不回执的，点名报出来 —— 它们就是"壁纸没变"的那几台
+                with self._dev_lock:
+                    acks = dict(self._acks.get(task, {}))
+                    online = [(str(d.get("ip") or k), str(d.get("host") or ""))
+                              for k, d in self.devices.items()]
+                done = {str(v[3]) for v in acks.values() if len(v) > 3}
+                silent = [ip for ip, _h in online if ip not in done]
+                if silent:
+                    self.log(f"{label}补发 {rounds - 1} 轮后仍有 {len(silent)} 台没回执："
+                             + "、".join(silent[:10])
+                             + ("…" if len(silent) > 10 else ""), "err")
+                    # 再探一次这些机器到底还在不在 —— 给出的结论要能指导下一步
+                    alive = self.probe(silent[:200], wait=4.0)
+                    dead = [ip for ip in silent if ip not in alive]
+                    # 按 /24 汇总：一眼看出"是哪几个网段整片没通"
+                    seg: dict[str, int] = {}
+                    for ip in silent:
+                        parts = ip.split(".")
+                        key = ".".join(parts[:3]) + ".0/24" if len(parts) == 4 else ip
+                        seg[key] = seg.get(key, 0) + 1
+                    if seg:
+                        self.log(f"{label}没回执的机器按网段汇总："
+                                 + "；".join(f"{k} → {v} 台"
+                                             for k, v in sorted(seg.items(),
+                                                                key=lambda kv: -kv[1])),
+                                 "warn")
+                    if alive:
+                        self.log(f"{label}其中 {len(alive)} 台**能回应扫描**：网络是通的，"
+                                 f"它们多半没收到公告、或者下载壁纸失败（检查被控端日志 "
+                                 f"agent.log；也确认控制端入站 TCP {self.tcp_port} 已放行）",
+                                 "warn")
+                    if dead:
+                        # 判断"包被谁丢了"：如果这些地址和本机**在同一个网段**，
+                        # 那就不存在路由问题 —— 包是被对方主机自己丢掉的
+                        # （Windows 防火墙没放行入站 UDP，或被 EDR 拦），
+                        # 所以第一步永远是去客户机上查那条防火墙规则。
+                        same_net = 0
+                        for ip in dead[:64]:
+                            try:
+                                addr = ipaddress.IPv4Address(ip)
+                            except ValueError:
+                                continue
+                            if any(addr in a.network for a in self.adapters
+                                   if a.usable):
+                                same_net += 1
+                        if same_net:
+                            self.log(f"{label}其中 {same_net} 台和被控端**在同一网段**"
+                                     f"（不存在路由问题）→ 包是被它们自己丢掉的："
+                                     f"多半是 Windows 防火墙没放行入站 UDP {self.udp_port}"
+                                     f"（旧版按 exe 路径建的规则会失效），或被安全软件拦了。"
+                                     f"在那台机器上跑一次： netsh advfirewall firewall "
+                                     f"add rule name=\"Win壁纸推送-UDP广播\" dir=in action=allow "
+                                     f"protocol=UDP localport={self.udp_port}", "err")
+                        self.log(f"{label}另有 {len(dead)} 台连扫描也不回应："
+                                 f"我这边的广播/单播到不了它们。常见原因：① 客户机防火墙"
+                                 f"没放行入站 UDP {self.udp_port}（它们的主动报到是**出站**，"
+                                 f"所以照样能出现在列表里）；② 无线 AP 客户端隔离 / VLAN 隔离；"
+                                 f"③ 那台机器有多张网卡、回包走了别的路由。"
+                                 f"先按①查（最便宜）。", "err")
+                else:
+                    self.log(f"{label}补发结束，所有在线设备都已回执", "ok")
+            threading.Thread(target=retry, name="announce-retry", daemon=True).start()
+
     def _broadcast(self, obj: dict, times: int = 3, gap: float = 0.25,
                    targets: list[str] | None = None) -> None:
         """把同一条消息重复广播几次，抵消 UDP 偶发丢包。
@@ -451,7 +691,15 @@ class ControllerCore:
         want_deep = self.sweep if deep is None else bool(deep)
         self.last_sweep_count = 0
         if want_deep:
-            hosts, notes = N.sweep_hosts(self.adapters or None)
+            # 除了本机网段，把「额外网段」和已知设备也一并探测
+            hosts, notes = N.sweep_hosts(self.adapters or None,
+                                         extra=self.spec_hosts)
+            known = self.known_ips()
+            for ip in known:
+                if ip not in hosts:
+                    hosts.append(ip)
+            if known:
+                notes.append(f"已知设备补充 {len(known)} 个探测目标")
             if hosts:
                 for note in notes:
                     self.log("单播探测范围：" + note, "dim")
@@ -494,13 +742,13 @@ class ControllerCore:
             for old in [t for t in self._acks if t != task][:-8]:
                 self._acks.pop(old, None)
 
-        self._broadcast(P.make(
+        self.announce(P.make(
             P.MSG_ANNOUNCE, task=task, name=name, size=len(data), sha256=sha,
             tcp_port=self.tcp_port, reply_port=self.reply_port,
             style=self.style, ts=time.time(),
-        ))
+        ), task, label="壁纸推送")
 
-        mode = f"（已从 {len(self._send_socks) or 1} 张网卡发出）"
+        mode = f"（广播 {len(self.targets)} 个目标 + 已知设备单播）"
         self.log(
             f"已广播壁纸「{name}」 {len(data) // 1024} KB · 契合度「{self.style}」"
             f" · 任务号 {task} {mode}",
@@ -574,6 +822,15 @@ class ControllerCore:
             P.MSG_TOAST, task=task, spec=clean, assets=manifest,
             tcp_port=self.tcp_port, reply_port=self.reply_port, ts=time.time(),
         ), targets=targets)
+        if not local_only:
+            # 广播之外再直接单播给已知设备：设备多的时候广播总有漏的
+            direct = self.known_ips()
+            if direct:
+                self._send_packet(P.dumps(P.make(
+                    P.MSG_TOAST, task=task, spec=clean, assets=manifest,
+                    tcp_port=self.tcp_port, reply_port=self.reply_port,
+                    ts=time.time())), direct)
+                self.log(f"通知已额外单播给 {len(direct)} 台已知设备", "dim")
 
         self.last_toast_task = task
         mode = "（只发本机测试）" if local_only else ""
@@ -610,6 +867,13 @@ class ControllerCore:
             P.MSG_SETNAME, task=task, app_name=clean,
             reply_port=self.reply_port, ts=time.time(),
         ), targets=targets)
+        if not local_only:
+            direct = self.known_ips()
+            if direct:
+                self._send_packet(P.dumps(P.make(
+                    P.MSG_SETNAME, task=task, app_name=clean,
+                    reply_port=self.reply_port, ts=time.time())), direct)
+                self.log(f"改名指令已额外单播给 {len(direct)} 台已知设备", "dim")
 
         shown = clean or "（默认：Win 壁纸推送）"
         mode = "（只发本机测试）" if local_only else ""
@@ -705,9 +969,9 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
         cfg["targets"] = core.extra_targets
         N.save_json(cfg_path, cfg)
         core.refresh_targets()
-
     def recheck_nics():
         apply_targets()
+        refresh_hint()
         log_q.put((f"已重新检测网卡：{N.adapter_summary(core.adapters) or '未检测到'}", "ok"))
 
     def choose():
@@ -756,6 +1020,14 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
                 task = core.push(p, style_var.get())
                 state["task"] = task
                 log_q.put((f"等待被控端确认（任务号 {task}）…", "dim"))
+                # 设备多的时候回执会慢慢齐：等 12 秒（期间补发线程也在跑）
+                deadline = time.time() + 12
+                while time.time() < deadline:
+                    time.sleep(0.3)
+                ok_n, fail_n, pending = core.ack_summary(task)
+                log_q.put((f"推送结果：成功 {ok_n} · 失败 {fail_n} · 待确认 {pending}"
+                           + (f"（待确认的会在日志里点名）" if pending else ""),
+                           "ok" if ok_n and not pending else "warn"))
                 state["status"] = ("  已推送  ", ui.OK)
             except Exception as e:
                 log_q.put((f"推送失败：{e}", "err"))
@@ -793,7 +1065,7 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
                 task = core.push_app_name(raw)
                 state["task"] = task
                 state["kind"] = "setname"
-                deadline = time.time() + 8
+                deadline = time.time() + 12
                 while time.time() < deadline:
                     time.sleep(0.3)
                 ok_n, fail_n, pending = core.ack_summary(task)
@@ -831,9 +1103,11 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
     book.pack(fill="both", expand=True)
     page_wall = ttk.Frame(book, padding=12)
     page_toast = ttk.Frame(book, padding=12)
+    page_ssh = ttk.Frame(book, padding=12)
     page_set = ttk.Frame(book, padding=12)
     book.add(page_wall, text="  壁纸  ")
     book.add(page_toast, text="  通知  ")
+    book.add(page_ssh, text="  远程命令  ")
     book.add(page_set, text="  设置  ")
 
     # ================= 页一：壁纸
@@ -879,7 +1153,29 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
                        f"（源码运行请确认 toastui.py 在，打包版请重新运行 build.bat）"
                   ).pack(anchor="w")
 
-    # ================= 页三：设置（那些偶尔才改的东西）
+    # ================= 页三：远程命令（SSH）—— 在每台设备上执行命令
+    # 设备列表在右边那列（控制端自己的设备表），所以这一页不用再手填网段：
+    # 默认目标就是"已经发现的在线设备"，选不中再手填。
+    # 为什么要留个 sel 中转：右侧设备列表 tree 是后面才建的，
+    # 而这一页现在就要一个"取当前选中"的回调，所以用个可变的槽位，建好再填进去。
+    sel = {"fn": None}
+    try:
+        import sshui
+
+        sshui.build_panel(
+            page_ssh, core, cfg, cfg_path,
+            log=lambda msg, level="info": log_q.put((msg, level)),
+            get_selection=lambda: (sel["fn"]() if sel["fn"] else []),
+        ).pack(fill="both", expand=True)
+    except Exception as e:                     # 打包缺模块时也要让人看懂
+        ttk.Label(page_ssh, style="TLabel", foreground=ui.ERR,
+                  wraplength=520, justify="left",
+                  text=f"远程命令页没加载起来：{e}\n"
+                       f"（源码运行请确认 sshui.py / sshcmd.py 在，"
+                       f"打包版请重新运行 build.bat）"
+                  ).pack(anchor="w")
+
+    # ================= 页四：设置（那些偶尔才改的东西）
     net_card = ttk.Frame(page_set, style="Card.TFrame", padding=14)
     net_card.pack(fill="x")
     ttk.Label(net_card, text="网络", style="Card.TLabel",
@@ -889,12 +1185,41 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
     nic_label.pack(anchor="w", pady=(4, 8))
     tgt = ttk.Frame(net_card, style="Card.TFrame")
     tgt.pack(fill="x")
-    ttk.Label(tgt, text="额外广播地址", style="Card.TLabel",
+    ttk.Label(tgt, text="额外网段/IP", style="Card.TLabel",
               foreground=ui.FG_DIM).pack(side="left", padx=(0, 8))
     tgt_var = tk.StringVar(value=" ".join(core.extra_targets))
     tgt_entry = ttk.Entry(tgt, textvariable=tgt_var)
     tgt_entry.pack(side="left", fill="x", expand=True)
-    ui.tooltip(tgt_entry, "只在跨网段推送时才需要，例如 192.168.2.255\n留空即可（同网段靠自动广播）")
+    ttk.Button(tgt, text="应用", width=6,
+               command=lambda: (apply_targets(), refresh_hint())).pack(side="left", padx=(6, 0))
+    ui.tooltip(tgt_entry,
+               "想指定网段就填这里，四种写法都认（空格或逗号分隔多个）：\n"
+               "  10.127.112.0/24      一个网段（会定向广播 + 逐台探测 254 个地址）\n"
+               "  10.127.112.255       广播地址\n"
+               "  10.127.112.10        单台机器（单播给它）\n"
+               "  10.127.112.1-10.127.112.60   地址范围\n"
+               "同网段本来就会自动广播，这里用于「有线那个网段扫不全」这类情况。")
+    tgt_hint = ttk.Label(net_card, text="", style="Card.TLabel",
+                         foreground=ui.FG_DIM, wraplength=560, justify="left")
+    tgt_hint.pack(anchor="w", pady=(6, 0))
+
+    def refresh_hint():
+        """把「额外网段」解析成人话显示出来（广播到哪、探测多少个地址）。"""
+        send, hosts, notes = N.parse_target_spec(" ".join(core.extra_targets))
+        if not core.extra_targets:
+            tgt_hint.configure(text="未指定额外网段：只用本机网卡自己的网段广播。",
+                               foreground=ui.FG_DIM)
+            return
+        parts = [f"解析结果：发送到 {'、'.join(send) if send else '（无）'}",
+                 f"，逐台探测 {len(hosts)} 个地址"]
+        if notes:
+            bad = [n for n in notes if "忽略" in n]
+            parts.append("；" + "；".join(notes))
+            tgt_hint.configure(text="".join(parts), foreground=ui.ERR if bad else ui.FG_DIM)
+        else:
+            tgt_hint.configure(text="".join(parts), foreground=ui.FG_DIM)
+
+    refresh_hint()      # 打开界面就把当前配置解析出来看看
 
     scan_card = ttk.Frame(page_set, style="Card.TFrame", padding=14)
     scan_card.pack(fill="x", pady=(10, 0))
@@ -964,6 +1289,8 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
     tree.tag_configure("fail", foreground=ui.ERR)
     tree.tag_configure("pending", foreground=ui.WARN)
     tree.tag_configure("offline", foreground=ui.FG_DIM)
+    # 「远程命令」页的「取右侧选中」按钮靠它拿到这里选中的机器
+    sel["fn"] = lambda: list(tree.selection())
 
     # ================= 底部：日志（默认收起）
     log_box = ttk.Frame(root, padding=(20, 8, 20, 14))
@@ -1031,7 +1358,17 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
                 tree.insert("", "end", iid=key, values=vals, tags=(tag,))
 
         online_n = sum(1 for d in devices.values() if now - d.get("last", 0) <= ONLINE_WINDOW)
-        dev_hint.configure(text=f"在线 {online_n} 台 / 共发现 {len(devices)} 台")
+        # 同名机器要提醒一句：克隆镜像/同批装机的客户机经常同计算机名，
+        # 以前按名字归并会把 50 台合成 1 行（用户实际踩过），现在按 IP 分开显示。
+        hosts: dict[str, int] = {}
+        for d in devices.values():
+            h = str(d.get("host") or "").strip().lower()
+            if h:
+                hosts[h] = hosts.get(h, 0) + 1
+        dup = sum(1 for n in hosts.values() if n > 1)
+        dev_hint.configure(
+            text=f"在线 {online_n} 台 / 共发现 {len(devices)} 台"
+                 + (f"（{dup} 个计算机名重名，已按 IP 分开显示）" if dup else ""))
         online_badge.configure(
             text=f"  在线 {online_n} 台  ",
             foreground=ui.OK if online_n else ui.FG_DIM)
@@ -1039,10 +1376,11 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
         nic_label.configure(text=ui_nic_text())
         sweep_txt = (f"广播 + 逐台单播（{core.last_sweep_count} 个地址）"
                      if core.last_sweep_count else
-                     ("广播 + 逐台单播" if core.sweep else "仅广播"))
+                     ("广播 + 逐台单播" if core.sweep else "仅广播（深度扫描已关）"))
         scan_hint.configure(
             text=f"扫描方式：{sweep_txt}"
-                 + (f" · 自动重扫 {int(core.auto_scan)}s" if core.auto_scan else ""))
+                 + (f" · 自动重扫 {int(core.auto_scan)}s" if core.auto_scan else ""),
+            foreground=ui.ERR if not core.sweep else ui.FG_DIM)
 
         if state["task"]:
             ok, fail, pending = core.ack_summary(state["task"])
@@ -1050,7 +1388,19 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
             progress.configure(
                 text=f"任务 {state['task']} · {info.get('name','')} · "
                      f"成功 {ok} · 失败 {fail} · 待确认 {pending}"
+                     + (f" · 在线 {online_n}" if online_n else "")
             )
+            # 没回执的机器点名列出来：它们就是"壁纸没变"的那几台
+            if info.get("kind") in ("toast", "setname") or info.get("name"):
+                acked_ips = {str(v[3]) for v in acks.values() if len(v) > 3}
+                silent = [str(d.get("ip") or k) for k, d in devices.items()
+                          if (d.get("ip") or k) not in acked_ips
+                          and now - d.get("last", 0) <= ONLINE_WINDOW]
+                if silent:
+                    progress.configure(text=progress.cget("text")
+                                       + f" · 没回执 {len(silent)} 台："
+                                       + "、".join(silent[:6])
+                                       + ("…" if len(silent) > 6 else ""))
             if info.get("kind") == "setname":
                 shown = info.get("name") or "（默认：Win 壁纸推送）"
                 fails = [v[1] for v in acks.values() if not v[0] and v[1]]
@@ -1121,14 +1471,23 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
     saved_w, saved_h = int(cfg.get("win_w") or 0), int(cfg.get("win_h") or 0)
     if saved_w >= 1000 and saved_h >= 640:
         ui.center(root, saved_w, saved_h)
+        root.update_idletasks()
+        # 记住的尺寸可能比内容还小（比如界面后来加了新控件 —— 实测就踩过：
+        # 加了个按钮之后内容宽了 9px，窗口仍按记住的尺寸开，右边就被切掉了）
+        need_w, need_h = root.winfo_reqwidth(), root.winfo_reqheight()
+        if need_w + 10 > saved_w or need_h + 10 > saved_h:
+            ui.fit(root, max(saved_w, need_w + 10), max(saved_h, need_h + 10))
     else:
-        ui.fit(root, 1180, 780)
+        ui.fit(root, 1240, 800)
     # 先启动：start() 里会算好广播目标地址，再打印才不是空的
     core.start()
 
     log_pane.write("提示：控制端需放行 TCP 38572，被控端需放行 UDP 38571"
                    "（见 add_firewall_rules.bat，管理员运行）", "warn")
-    log_pane.write("准备就绪：选图片 → 「广播推送」；发通知走「通知」页", "ok")
+    if N.json_config_warning():
+        log_pane.write(N.json_config_warning(), "err")
+    log_pane.write("准备就绪：选图片 → 「广播推送」；发通知走「通知」页；"
+                   "在设备上跑命令走「远程命令」页", "ok")
 
     # 首次扫描放到后台线程里：深度扫描会发几百个包，不能让界面卡住
     threading.Thread(target=lambda: core.scan(), daemon=True).start()
@@ -1256,6 +1615,150 @@ def run_cli_set_app_name(core: "ControllerCore", args) -> int:
     return 0
 
 
+def run_cli_ssh(core: "ControllerCore", args) -> int:
+    """命令行执行远程命令（SSH），方便脚本化 / 定时任务。
+
+        python controller.py --ssh-cmd "hostname"
+        python controller.py --ssh-cmd "uwfmgr filter disable" --ssh-targets 10.127.112.1-56
+        python controller.py --ssh-cmd "shutdown /r /t 0" --ssh-mode oneshot
+
+    目标没给 `--ssh-targets` 时，就先扫一遍局域网，发给**当前在线的设备**
+    （用 --wait 控制扫描后等多久再开跑）。
+    """
+    def log(msg, level="info"):
+        mark = {"ok": "OK  ", "err": "ERR ", "warn": "WARN", "dim": "    "}.get(level, "    ")
+        print(f"[{time.strftime('%H:%M:%S')}] {mark} {msg}", flush=True)
+
+    cmds: list[str] = []
+    for raw in (args.ssh_cmd or []):
+        cmds += SC.parse_commands(raw)
+    if not cmds:
+        print("没有可执行的命令（--ssh-cmd 至少要给一条）", file=sys.stderr)
+        return 1
+
+    s = SC.normalize_cfg(core.cfg.get("ssh"))
+    if args.ssh_user:
+        s["user"] = args.ssh_user
+    if args.ssh_key:
+        s["key"] = args.ssh_key
+    if args.ssh_mode:
+        s["mode"] = args.ssh_mode
+    if args.ssh_timeout:
+        s["timeout"] = args.ssh_timeout
+    if args.ssh_workers:
+        s["workers"] = args.ssh_workers
+
+    ok_ssh, info = SC.ssh_available(s)
+    if not ok_ssh:
+        print(info, file=sys.stderr)
+        return 1
+
+    if args.ssh_targets:
+        ips, notes = SC.spec_ips(args.ssh_targets)
+        for n in notes:
+            log(n, "dim")
+    else:
+        core.log = log
+        core.start()
+        core.scan(deep=None if args.sweep is None else args.sweep)
+        wait = args.wait if args.wait is not None else 4.0
+        log(f"等待 {wait:g} 秒收集设备回应…", "dim")
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            time.sleep(0.3)
+        ips = SC.clean_ips([d.get("ip") or k for k, d in core.online_devices()])
+        if not ips:
+            log("没有发现任何在线设备（可以用 --ssh-targets 直接指定网段）", "err")
+            core.stop()
+            return 3
+
+    if not ips:
+        print("目标为空：--ssh-targets 没解析出任何地址", file=sys.stderr)
+        return 1
+
+    print(SC.plan_text(ips, s, cmds), flush=True)
+    print("-" * 62, flush=True)
+    results = SC.run_hosts(ips, s, cmds, log=log)
+    core.stop()
+
+    print("-" * 62)
+    for r in results:
+        # 命令行里用纯文字状态：中文 cmd（936 代码页）显示不了 ✅/📤 这些符号
+        print(f"  {r.ip:<16} {SC.plain_state(r.state):<8} {r.seconds:5.1f}s  "
+              f"{r.error or SC.first_lines(r.evidence, 1, 80)}", flush=True)
+    st = SC.summarize(results)
+    print(f"共 {st['total']} 台：成功 {st[SC.STATE_OK]} · 已下发 {st[SC.STATE_SENT]} · "
+          f"部分成功 {st[SC.STATE_PART]} · 失败 {st[SC.STATE_FAIL]}", flush=True)
+    if not results:
+        return 3
+    if st[SC.STATE_FAIL]:
+        return 2
+    return 0
+
+
+def run_cli_check_ip(core: "ControllerCore", args) -> int:
+    """检查某一个 IP 到底在不在探测范围里、能不能联系上。
+
+    用户问过"我有一台是 .98，探测列表里没有，是不是你设置了范围" ——
+    这个命令就是回答这个问题的：先把"这个地址在不在要扫的范围里"打出来，
+    再实际发一次单播探测，最后给出没回应的可能原因。
+    """
+    def log(msg, level="info"):
+        print(msg, flush=True)
+
+    target = str(args.check_ip or "").strip()
+    try:
+        import ipaddress as _ip
+
+        addr = _ip.IPv4Address(target)
+    except ValueError:
+        print(f"「{target}」不是合法的 IPv4 地址", file=sys.stderr)
+        return 1
+
+    core.log = log
+    core.start()          # start() 里已经枚举网卡 / 算好广播目标了
+
+    usable = [a for a in core.adapters if a.usable]
+    print("-" * 62)
+    inside = []
+    for ad in usable:
+        net = ad.network
+        if addr in net:
+            inside.append(ad)
+            print(f"网卡 {ad.kind_name} {ad.ip}/{ad.prefix}（{ad.title}）")
+            print(f"  该地址在这个网段内 ✓  本网段要扫的地址："
+                  f"{net.network_address + 1} … {net.broadcast_address - 1}"
+                  f"（共 {max(0, net.num_addresses - 2)} 个，含 {addr}）")
+    if not inside:
+        print(f"⚠ 本机没有任何网卡覆盖 {addr} —— 它在别的网段：")
+        print("   * 如果你填了「额外网段」，它会被定向广播 + 逐台单播探测；")
+        print("   * 否则只能靠它主动报到（广播）被发现，扫描扫不到它。")
+    hosts, notes = N.sweep_hosts(core.adapters or None, extra=core.spec_hosts)
+    if str(addr) in hosts:
+        print(f"实际探测列表里包含 {addr} ✓（本次要探测 {len(hosts)} 个地址）")
+    else:
+        print(f"实际探测列表里**不含** {addr}（本次 {len(hosts)} 个地址）"
+              f" —— 原因见上面的说明")
+
+    print(f"正在探测 {addr} …")
+    alive = core.probe([str(addr)], wait=4.0)
+    if str(addr) in alive:
+        print(f"✓ {addr} 回应了探测：网络是通的，它应该能收到推送。")
+        print("  如果它还是没换壁纸，去它自己的 agent.log 看下载那一步。")
+    else:
+        print(f"✗ {addr} 没有回应。按可能性排查：")
+        print(f"   ① 这台机器上被控端没在跑：在它上面执行  WallpaperAgent.exe --status")
+        print(f"   ② 它的入站 UDP {core.udp_port} 被防火墙/安全软件挡了（最常见）：")
+        print(f"      在它上面执行  netsh advfirewall firewall show rule name=all dir=in | findstr {core.udp_port}")
+        print(f"      没有输出就是没放行，补一条：")
+        print(f"      netsh advfirewall firewall add rule name=\"WinWallpaperPush-UDP-Broadcast\""
+              f" dir=in action=allow protocol=UDP localport={core.udp_port}")
+        print("   ③ 它的地址其实是别的（多张网卡 / DHCP 换过）—— 在它上面用 ipconfig 看一眼")
+        print("   ④ 老版本被控端没有「主动报到」：那它一旦收不到我们的包就完全隐身")
+    core.stop()
+    return 0
+
+
 def run_cli(core: ControllerCore, args) -> int:
     def log(msg, level="info"):
         mark = {"ok": "OK  ", "err": "ERR ", "warn": "WARN", "dim": "    "}.get(level, "    ")
@@ -1329,6 +1832,25 @@ def main(argv=None) -> int:
     ap.add_argument("--set-app-name", dest="set_app_name", metavar="名字",
                     help="广播改被控端「通知上显示的应用名」（持久化，重启仍生效）；"
                          "填 default 让它们恢复默认名字")
+    ap.add_argument("--check-ip", dest="check_ip", metavar="IP",
+                    help="检查某个 IP 在不在探测范围里、能不能联系上（排查「这台没反应」）")
+    # ---- 远程命令（SSH）：用系统自带的 ssh 客户端在每台设备上执行命令
+    ap.add_argument("--ssh-cmd", dest="ssh_cmd", action="append", metavar="命令",
+                    help="在每台设备上执行的命令（可给多次；命令里也能用换行分多条）")
+    ap.add_argument("--ssh-targets", dest="ssh_targets", metavar="网段/IP",
+                    help="发给哪些地址，例如 10.127.112.1-56 或 10.127.112.0/24；"
+                         "不给就先扫局域网，发给在线设备")
+    ap.add_argument("--ssh-user", dest="ssh_user", metavar="用户名",
+                    help="覆盖远程命令用的 SSH 用户名")
+    ap.add_argument("--ssh-key", dest="ssh_key", metavar="私钥",
+                    help="覆盖 ssh -i 的私钥路径")
+    ap.add_argument("--ssh-mode", dest="ssh_mode", choices=[SC.MODE_SESSION, SC.MODE_ONESHOT],
+                    help=f"执行方式：{SC.MODE_SESSION}（登录一次逐条发，默认）/"
+                         f"{SC.MODE_ONESHOT}（每条一次连接，有退出码）")
+    ap.add_argument("--ssh-timeout", dest="ssh_timeout", type=float, metavar="秒",
+                    help="单条命令超时秒数（默认 25）")
+    ap.add_argument("--ssh-workers", dest="ssh_workers", type=int, metavar="台",
+                    help="远程命令并发台数（默认 4）")
     ap.add_argument("--scan", action="store_true", help="广播扫描在线设备")
     ap.add_argument("--wait", type=float, help="命令模式下等待回应的秒数")
     ap.add_argument("--style", help=f"壁纸契合度：{P.style_help()}")
@@ -1345,15 +1867,34 @@ def main(argv=None) -> int:
 
     if args.selftest:
         adapters = N.list_adapters()
-        hosts, notes = N.sweep_hosts(adapters)
+        # 自检在配置加载之前跑，这里自己读一次配置，好把「额外网段」也算进去
+        _cfg_self = dict(DEFAULT_CFG)
+        _cfg_self.update(N.load_json(os.path.join(N.app_dir(),
+                                                  "controller_config.json")))
+        if args.targets:
+            _cfg_self["targets"] = [x for x in args.targets.replace(",", " ").split() if x]
+        extra_raw = [str(x) for x in (_cfg_self.get("targets") or [])]
+        spec_send, spec_hosts, spec_notes = N.parse_target_spec(" ".join(extra_raw))
+        hosts, notes = N.sweep_hosts(adapters, extra=spec_hosts)
         print(f"{APP_NAME} v{APP_VER}")
         print("Python :", sys.version.split()[0])
         print("本机网卡（有线 / 无线都会列出）：")
         for line in N.adapter_report(adapters):
             print(line)
-        print("广播目标:", ", ".join(N.broadcast_targets(adapters=adapters)) or "（无）")
+        skipped = [a for a in adapters if not a.usable]
+        if skipped:
+            print("未参与广播的网卡：")
+            for ad in skipped:
+                print(f"  {ad.ip or '（无地址）'} {ad.title}"
+                      f"（{'已断开' if not ad.up else '不可用于局域网广播'}）")
+        print("广播目标:", ", ".join(N.broadcast_targets(spec_send, adapters=adapters)) or "（无）")
         print("本机 IP :", ", ".join(N.local_ipv4_list()) or "（未检测到）")
-        print(f"单播探测: {len(hosts)} 个地址")
+        if extra_raw:
+            print("额外网段:", " ".join(extra_raw))
+            for note in spec_notes:
+                print("          " + note)
+        print(f"单播探测: {len(hosts)} 个地址"
+              + (f"（{hosts[0]} … {hosts[-1]}）" if hosts else ""))
         for note in notes:
             print("          " + note)
         return 0
@@ -1361,6 +1902,10 @@ def main(argv=None) -> int:
     cfg_path = os.path.join(N.app_dir(), "controller_config.json")
     cfg = dict(DEFAULT_CFG)
     cfg.update(N.load_json(cfg_path))
+    # 配置文件读不出来时必须说一句：否则用户看到的是"配置改了不生效"，
+    # 然后程序还会把默认值写回去，把他的设置覆盖掉。
+    if N.json_config_warning():
+        print(N.json_config_warning(), file=sys.stderr)
     if args.port:
         cfg["udp_port"] = args.port
     if args.style:
@@ -1376,6 +1921,8 @@ def main(argv=None) -> int:
         cfg["sweep"] = bool(args.sweep)
     if args.auto_scan is not None:
         cfg["auto_scan"] = max(0.0, float(args.auto_scan))
+    # 远程命令的设置也统一在这里洗干净（界面和命令行共用同一份）
+    cfg["ssh"] = SC.normalize_cfg(cfg.get("ssh"))
     N.save_json(cfg_path, cfg)
 
     core = ControllerCore(cfg)
@@ -1385,6 +1932,12 @@ def main(argv=None) -> int:
 
     if args.set_app_name is not None:
         return run_cli_set_app_name(core, args)
+
+    if args.check_ip:
+        return run_cli_check_ip(core, args)
+
+    if args.ssh_cmd:
+        return run_cli_ssh(core, args)
 
     if args.push or args.scan:
         return run_cli(core, args)
