@@ -4,7 +4,7 @@
     "reply_port":  38573,
     "style":  "填充",
     "targets":  [
-                    "10.127.112.0/24"
+                    "192.168.1.0/24"
                 ],
     "sweep":  true,
     "auto_scan":  30,

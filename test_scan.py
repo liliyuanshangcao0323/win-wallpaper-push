@@ -186,21 +186,21 @@ def test_target_spec() -> None:
     """用户填「额外网段」：以前只认广播地址，现在 CIDR / 范围 / 单机都认。"""
     print("\n[3b] 指定网段（额外网段解析）")
 
-    send, hosts, notes = N.parse_target_spec("10.127.112.0/24")
-    check(send == ["10.127.112.255"], "10.127.112.0/24 → 定向广播 10.127.112.255",
+    send, hosts, notes = N.parse_target_spec("192.168.1.0/24")
+    check(send == ["192.168.1.255"], "192.168.1.0/24 → 定向广播 192.168.1.255",
           "，".join(send))
-    check(len(hosts) == 254 and hosts[0] == "10.127.112.1" and hosts[-1] == "10.127.112.254",
+    check(len(hosts) == 254 and hosts[0] == "192.168.1.1" and hosts[-1] == "192.168.1.254",
           "同一个网段会逐台探测 254 个地址", f"{len(hosts)} 个：{hosts[:2]}…{hosts[-1:]}")
 
-    send2, hosts2, _n2 = N.parse_target_spec("10.127.112.255")
-    check(send2 == ["10.127.112.255"] and len(hosts2) == 254,
+    send2, hosts2, _n2 = N.parse_target_spec("192.168.1.255")
+    check(send2 == ["192.168.1.255"] and len(hosts2) == 254,
           "直接填广播地址也能用（顺带扫这一整个 /24）", f"{send2} / {len(hosts2)} 个")
 
-    send3, hosts3, _n3 = N.parse_target_spec("10.127.112.77")
-    check(send3 == ["10.127.112.77"] and hosts3 == ["10.127.112.77"],
+    send3, hosts3, _n3 = N.parse_target_spec("192.168.1.77")
+    check(send3 == ["192.168.1.77"] and hosts3 == ["192.168.1.77"],
           "填单台机器 → 只单播给它", f"{send3} / {hosts3}")
 
-    _s4, hosts4, _n4 = N.parse_target_spec("10.127.112.1-10.127.112.5")
+    _s4, hosts4, _n4 = N.parse_target_spec("192.168.1.1-192.168.1.5")
     check(len(hosts4) == 5, "地址范围会展开成 5 个地址", str(hosts4))
 
     send5, hosts5, notes5 = N.parse_target_spec("10.0.0.0/16")
@@ -213,15 +213,15 @@ def test_target_spec() -> None:
           "非法写法被忽略、合法的照常用", "；".join(notes6))
     check(any("忽略" in n for n in notes6), "非法写法会在日志里说明原因")
 
-    multi_send, multi_hosts, _n7 = N.parse_target_spec("10.127.112.0/24 192.168.2.0/24")
+    multi_send, multi_hosts, _n7 = N.parse_target_spec("192.168.1.0/24 192.168.2.0/24")
     check(len(multi_send) == 2 and len(multi_hosts) == 508,
           "多个网段可以一起填（空格/逗号分隔）", f"{multi_send} / {len(multi_hosts)} 个")
 
     # 指定网段要真的进到探测列表里（这才是"扫得到"的关键）
     ads = [wired("10.13.3.214", 16)]          # 模拟控制端那张 /16 的网卡
     hosts_all, notes_all = N.sweep_hosts(ads, include_arp=False,
-                                         extra=["10.127.112.1", "10.127.112.2"])
-    check("10.127.112.1" in hosts_all and "10.127.112.2" in hosts_all,
+                                         extra=["192.168.1.1", "192.168.1.2"])
+    check("192.168.1.1" in hosts_all and "192.168.1.2" in hosts_all,
           "手工指定的地址会进到逐台探测列表里（大网段也照扫）",
           f"共 {len(hosts_all)} 个")
     check(any("手工指定" in n for n in notes_all), "日志里会写明补了多少个目标",
@@ -229,16 +229,16 @@ def test_target_spec() -> None:
 
     # 用户问过："我有一台是 .98，探测列表里没有，是不是你设置了范围"
     # —— 一个 /24 就是整段 .1~.254，任何一台都在里面，不该有例外
-    lan = wired("10.127.112.153", 24)
+    lan = wired("192.168.1.100", 24)
     hosts24, _n24 = N.sweep_hosts([lan], include_arp=False)
     check(len(hosts24) == 254, "/24 网段会探测 254 个地址（不是抽样的子集）",
           f"{len(hosts24)} 个")
     check(all(f"10.127.112.{i}" in hosts24 for i in (1, 98, 150, 254)),
           "网段里任意一台都在探测列表里（含 .98）",
           f"范围 {hosts24[0]} … {hosts24[-1]}")
-    spec_send, spec_hosts24, _n = N.parse_target_spec("10.127.112.0/24")
-    check(f"10.127.112.98" in spec_hosts24,
-          "手填 10.127.112.0/24 时也会把 .98 算进去", f"{len(spec_hosts24)} 个")
+    spec_send, spec_hosts24, _n = N.parse_target_spec("192.168.1.0/24")
+    check(f"192.168.1.98" in spec_hosts24,
+          "手填 192.168.1.0/24 时也会把 .98 算进去", f"{len(spec_hosts24)} 个")
 
 
 # ---------------------------------------------------------------- 4. 发送路由
@@ -439,7 +439,7 @@ def test_end_to_end() -> None:
 
                 # 补发完还不回执的机器：要点名 + 探一次"它到底还在不在"
                 ctrl_logs.clear()
-                ctrl._touch_device("10.127.112.99", "PC-LOST", "user", "", 0)
+                ctrl._touch_device("192.168.1.99", "PC-LOST", "user", "", 0)
                 ping2 = P.make("noop", ts=time.time())
                 ctrl.announce(ping2, "task-lost-test", rounds=2, gap=0.5,
                               label="掉线测试")
@@ -449,7 +449,7 @@ def test_end_to_end() -> None:
                         break
                     time.sleep(0.3)
                 joined = "；".join(ctrl_logs)
-                check("10.127.112.99" in joined and "没回执" in joined,
+                check("192.168.1.99" in joined and "没回执" in joined,
                       "没回执的机器会被点名列出", joined[:100] or "（没有）")
                 # 探测要等 4 秒才有结论，这里再等一会儿
                 deadline = time.time() + 12

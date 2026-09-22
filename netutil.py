@@ -562,12 +562,12 @@ def parse_target_spec(text: str, max_sweep: int = 4094) -> tuple[list[str], list
     """把用户填的「额外网段 / 地址」解析成 (发送目标, 逐台探测地址, 说明)。
 
     为什么要这个：以前这里只认**广播地址**（例如 192.168.2.255），想"指定一个网段"
-    （手上只有 10.127.112.0/24 这种写法）就没法用。现在四种写法都认：
+    （手上只有 192.168.1.0/24 这种写法）就没法用。现在四种写法都认：
 
-      10.127.112.0/24               网段 → 发定向广播 10.127.112.255，并逐台探测 254 个地址
-      10.127.112.255                单个地址 → 直接发给它（广播地址就是这么发的），并顺带扫这个 /24
-      10.127.112.10                 单台机器 → 单播给它，也作为探测目标
-      10.127.112.1-10.127.112.60    地址范围 → 逐个单播 / 探测
+      192.168.1.0/24               网段 → 发定向广播 192.168.1.255，并逐台探测 254 个地址
+      192.168.1.255                单个地址 → 直接发给它（广播地址就是这么发的），并顺带扫这个 /24
+      192.168.1.10                 单台机器 → 单播给它，也作为探测目标
+      192.168.1.1-10.127.112.60    地址范围 → 逐个单播 / 探测
 
     超过 max_sweep 的大网段只取前 max_sweep 个地址（说明里会写清楚），
     免得手滑填个 /8 把网络打爆。
@@ -594,7 +594,7 @@ def parse_target_spec(text: str, max_sweep: int = 4094) -> tuple[list[str], list
             try:
                 net = ipaddress.IPv4Network(part, strict=False)
             except ValueError:
-                notes.append(f"「{part}」不是合法的网段写法（例如 10.127.112.0/24），已忽略")
+                notes.append(f"「{part}」不是合法的网段写法（例如 192.168.1.0/24），已忽略")
                 continue
             add_send(str(net.broadcast_address))
             total = max(0, net.num_addresses - 2)
@@ -691,7 +691,7 @@ def sweep_hosts(adapters: list[Adapter] | None = None,
             notes.append(
                 f"{ad.kind_name} {ad.ip}/{ad.prefix} 网段过大（{ad.host_count} 台），"
                 f"只扫本机所在 {small} 这 254 个地址；要扫别的网段就填进"
-                f"「额外网段」里（例如 10.127.112.0/24）"
+                f"「额外网段」里（例如 192.168.1.0/24）"
             )
 
     if extra:

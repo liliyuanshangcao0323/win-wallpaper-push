@@ -154,7 +154,7 @@ class ControllerCore:
         发一遍，客户机在哪张网卡上都能收到。
 
         「额外网段」支持四种写法（见 netutil.parse_target_spec）：
-        `10.127.112.0/24`、`10.127.112.255`、单台 IP、地址范围。
+        `192.168.1.0/24`、`192.168.1.255`、单台 IP、地址范围。
         """
         self.adapters = N.list_adapters()
         # 手填的网段/地址：解析出「发到哪儿」和「逐台探测哪些地址」
@@ -162,7 +162,7 @@ class ControllerCore:
             " ".join(self.extra_targets))
         self.spec_hosts = spec_hosts
         # 只把**解析出来的**地址当发送目标：以前这里会把手填的原始字符串
-        # 直接塞进目标列表，于是 `10.127.112.2-10.127.112.9` 这种范围写法
+        # 直接塞进目标列表，于是 `192.168.1.2-10.127.112.9` 这种范围写法
         # 会被当成域名去解析（日志里一堆 getaddrinfo failed）
         self.targets = N.broadcast_targets(spec_send, adapters=self.adapters)
         # 换发送套接字时和正在广播的线程（自动重扫 / 推送）串行，
@@ -1194,10 +1194,10 @@ def run_gui(core: ControllerCore, cfg: dict, cfg_path: str) -> int:
                command=lambda: (apply_targets(), refresh_hint())).pack(side="left", padx=(6, 0))
     ui.tooltip(tgt_entry,
                "想指定网段就填这里，四种写法都认（空格或逗号分隔多个）：\n"
-               "  10.127.112.0/24      一个网段（会定向广播 + 逐台探测 254 个地址）\n"
-               "  10.127.112.255       广播地址\n"
-               "  10.127.112.10        单台机器（单播给它）\n"
-               "  10.127.112.1-10.127.112.60   地址范围\n"
+               "  192.168.1.0/24      一个网段（会定向广播 + 逐台探测 254 个地址）\n"
+               "  192.168.1.255       广播地址\n"
+               "  192.168.1.10        单台机器（单播给它）\n"
+               "  192.168.1.1-10.127.112.60   地址范围\n"
                "同网段本来就会自动广播，这里用于「有线那个网段扫不全」这类情况。")
     tgt_hint = ttk.Label(net_card, text="", style="Card.TLabel",
                          foreground=ui.FG_DIM, wraplength=560, justify="left")
@@ -1619,7 +1619,7 @@ def run_cli_ssh(core: "ControllerCore", args) -> int:
     """命令行执行远程命令（SSH），方便脚本化 / 定时任务。
 
         python controller.py --ssh-cmd "hostname"
-        python controller.py --ssh-cmd "uwfmgr filter disable" --ssh-targets 10.127.112.1-56
+        python controller.py --ssh-cmd "uwfmgr filter disable" --ssh-targets 192.168.1.1-56
         python controller.py --ssh-cmd "shutdown /r /t 0" --ssh-mode oneshot
 
     目标没给 `--ssh-targets` 时，就先扫一遍局域网，发给**当前在线的设备**
@@ -1838,7 +1838,7 @@ def main(argv=None) -> int:
     ap.add_argument("--ssh-cmd", dest="ssh_cmd", action="append", metavar="命令",
                     help="在每台设备上执行的命令（可给多次；命令里也能用换行分多条）")
     ap.add_argument("--ssh-targets", dest="ssh_targets", metavar="网段/IP",
-                    help="发给哪些地址，例如 10.127.112.1-56 或 10.127.112.0/24；"
+                    help="发给哪些地址，例如 192.168.1.1-56 或 192.168.1.0/24；"
                          "不给就先扫局域网，发给在线设备")
     ap.add_argument("--ssh-user", dest="ssh_user", metavar="用户名",
                     help="覆盖远程命令用的 SSH 用户名")

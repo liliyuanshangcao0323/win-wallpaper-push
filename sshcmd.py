@@ -8,7 +8,7 @@
    被控端不用装任何东西，控制端 exe 里也不用再塞一个第三方库；
 2. 执行的命令和人工在 cmd 里敲的**一模一样**，就是这条原始命令：
 
-       ssh -i "C:\\User\\.ssh\\id_ed25519" Lonovo@<IP> "命令"
+       ssh -i "~/.ssh/id_ed25519" admin@<IP> "命令"
 
    界面上会把当前设置拼成的完整命令实时显示出来，方便逐字核对；
 3. 这套「起 ssh 子进程 → 首次连接替人回答 yes → 等 shell 起来 → 发命令 →
@@ -56,7 +56,7 @@ from concurrent.futures import ThreadPoolExecutor
 # 前五项刻意与已跑通的 UWF 批量工具保持一致（同一批机器、同一把私钥），
 # 用户打开界面就能直接用，不用重新填。
 DEFAULT_KEY = os.path.join(os.path.expanduser("~"), ".ssh", "id_ed25519")
-DEFAULT_USER = os.getenv("USERNAME", "Lonovo")
+DEFAULT_USER = os.getenv("USERNAME", "admin")
 DEFAULT_EXTRA = "-o ConnectTimeout=10"
 DEFAULT_WORKERS = 4
 DEFAULT_YES_WAIT = 5.0
@@ -400,10 +400,10 @@ _SHORT_RANGE_RE = re.compile(r"^(\d+\.\d+\.\d+\.)(\d+)\s*-\s*(\d+)$")
 
 
 def expand_short_range(text: str) -> tuple[str, list[str]]:
-    """把 `10.127.112.1-56` 这种简写展开成完整范围写法（UWF 工具的习惯写法）。
+    """把 `192.168.1.1-56` 这种简写展开成完整范围写法（UWF 工具的习惯写法）。
 
     返回（展开后的文本, 说明）。netutil.parse_target_spec 只认
-    `10.127.112.1-10.127.112.60` 这种两段都写全的写法，而机房里口头说的都是
+    `192.168.1.1-10.127.112.60` 这种两段都写全的写法，而机房里口头说的都是
     "1 到 56"，所以这里先补全再交给它。
     """
     notes: list[str] = []
@@ -425,10 +425,10 @@ def spec_ips(text: str, max_hosts: int = 4094) -> tuple[list[str], list[str]]:
     """解析用户手填的网段 / IP / 范围 → (地址列表, 说明)。
 
     认这几种写法（和「设置」页里"额外网段"一致，多一种简写）：
-        10.127.112.0/24              整个网段（最多 max_hosts 个）
-        10.127.112.98                单台
-        10.127.112.1-10.127.112.60   范围
-        10.127.112.1-56              范围简写（前缀相同）
+        192.168.1.0/24              整个网段（最多 max_hosts 个）
+        192.168.1.98                单台
+        192.168.1.1-10.127.112.60   范围
+        192.168.1.1-56              范围简写（前缀相同）
     """
     import netutil as N   # 延迟导入：这个模块自身不依赖项目的其他部分
 
@@ -747,7 +747,7 @@ def strip_echo(out: str, command: str, sentinel: str) -> str:
     """从会话回显里去掉「命令本身那一行」和结束标记，只留远端真正的输出。
 
     为什么要这么挑：远端 shell 会把我们的输入回显回来（前面还带个提示符，
-    形如 `C:\\Users\\Lonovo>hostname`），全留着的话"结果证据"那一列就全是
+    形如 `C:\\Users\\admin>hostname`），全留着的话"结果证据"那一列就全是
     自己刚发出去的命令，看不到远端到底说了什么。
 
     特殊情况：登录后 force_utf8() 发的 `chcp 65001 ... powershell.exe ...` 命令

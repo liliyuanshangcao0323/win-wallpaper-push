@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Win 壁纸推送系统",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1160, 520]
+  },
+  "components": [
+    { "id": "admin", "type": "external", "label": "管理员", "pos": [30, 220], "size": [100, 50] },
+    { "id": "ctrl", "type": "backend", "label": "控制端", "sublabel": "WallpaperController.exe", "pos": [200, 180], "size": [150, 60] },
+    { "id": "proto", "type": "messagebus", "label": "局域网协议", "sublabel": "UDP 38571 / TCP 38572 / UDP 38573", "pos": [440, 100], "size": [180, 44] },
+    { "id": "ssh", "type": "security", "label": "SSH", "sublabel": "TCP 22", "pos": [440, 380], "size": [180, 44] },
+    { "id": "agents", "type": "frontend", "label": "被控端 ×N", "sublabel": "WallpaperAgent.exe", "pos": [720, 180], "size": [150, 60] },
+    { "id": "wallpaper", "type": "database", "label": "壁纸缓存", "pos": [960, 100], "size": [110, 40] },
+    { "id": "toast", "type": "external", "label": "Windows 通知", "pos": [960, 200], "size": [110, 40] },
+    { "id": "desktop", "type": "cloud", "label": "桌面壁纸", "pos": [960, 300], "size": [110, 40] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "局域网", "wraps": ["ctrl", "proto", "ssh", "agents"] }
+  ],
+  "connections": [
+    { "id": "c1", "from": "admin", "to": "ctrl", "variant": "emphasis" },
+    { "id": "c2", "from": "ctrl", "to": "proto", "label": "广播+传输+回执" },
+    { "id": "c3", "from": "ctrl", "to": "ssh", "label": "远程命令" },
+    { "id": "c4", "from": "proto", "to": "agents", "label": "公告/拉取/回执" },
+    { "id": "c5", "from": "ssh", "to": "agents", "label": "SSH 执行" },
+    { "id": "c6", "from": "agents", "to": "wallpaper", "variant": "dashed" },
+    { "id": "c7", "from": "agents", "to": "toast", "variant": "dashed" },
+    { "id": "c8", "from": "agents", "to": "desktop", "variant": "dashed" }
+  ]
+}

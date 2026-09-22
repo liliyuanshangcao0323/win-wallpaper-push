@@ -6,10 +6,10 @@
 
     远程命令页（内嵌）────────────────────────────────────────┐
     │ 目标：○在线设备(48) ○全部已发现(52) ○自定义网段/IP      │
-    │       自定义: [10.127.112.1-56        ] [取右侧选中][扫描]│
-    │       解析提示：56 个地址（10.127.112.1 … 10.127.112.56）│
-    │ 登录设置：私钥 -i [C:\\User\\.ssh\\id_ed25519] [浏览…]    │
-    │           用户名 [Lonovo] 附加参数 [-o ConnectTimeout=10] │
+    │       自定义: [192.168.1.1-56        ] [取右侧选中][扫描]│
+    │       解析提示：56 个地址（192.168.1.1 … 192.168.1.56）│
+    │ 登录设置：私钥 -i [~/.ssh/id_ed25519] [浏览…]    │
+    │           用户名 [admin] 附加参数 [-o ConnectTimeout=10] │
     │           ☑首次连接自动接受主机密钥  并发[4] 超时[25]秒   │
     │           ssh 客户端：C:\\…\\OpenSSH\\ssh.exe（或红字警告）│
     │ 命令：预设[▾] [填入][追加]   方式[会话式 ▾]              │
@@ -126,10 +126,10 @@ def build_panel(parent: tk.Misc, core, cfg: dict, cfg_path: str,
     tgt_entry.pack(side="left", fill="x", expand=True)
     ui.tooltip(tgt_entry,
                "只在选「自定义网段/IP」时生效，四种写法都认（空格或逗号分隔多个）：\n"
-               "  10.127.112.0/24              整个网段\n"
-               "  10.127.112.1-10.127.112.60   地址范围\n"
-               "  10.127.112.1-56              范围简写（前缀相同）\n"
-               "  10.127.112.98                单台机器")
+               "  192.168.1.0/24              整个网段\n"
+               "  192.168.1.1-10.127.112.60   地址范围\n"
+               "  192.168.1.1-56              范围简写（前缀相同）\n"
+               "  192.168.1.98                单台机器")
     pick_btn = ttk.Button(tgt_row, text="取右侧选中", width=10,
                           command=lambda: take_selection())
     pick_btn.pack(side="left", padx=(6, 0))
@@ -365,7 +365,7 @@ def build_panel(parent: tk.Misc, core, cfg: dict, cfg_path: str,
         else:
             ssh_hint.configure(
                 text=f"ssh 客户端：{info_ssh}　·　私钥已找到　·　"
-                     f"实际执行的命令：{SC.display_command(collect(), ips[0] if ips else '10.127.112.98')}",
+                     f"实际执行的命令：{SC.display_command(collect(), ips[0] if ips else '192.168.1.98')}",
                 foreground=ui.FG_DIM)
 
         # 单选按钮上带上台数，一眼能看出"发得出去几台"
@@ -447,7 +447,7 @@ def build_panel(parent: tk.Misc, core, cfg: dict, cfg_path: str,
                 "没有目标设备",
                 "当前目标里一台设备都没有。\n\n"
                 "·「在线设备」来自控制端的设备表 —— 先点「扫描」；\n"
-                "· 或者选「自定义网段/IP」自己填，例如 10.127.112.1-56。")
+                "· 或者选「自定义网段/IP」自己填，例如 192.168.1.1-56。")
             return
         ok_ssh, info_ssh = SC.ssh_available(s)
         if not ok_ssh:

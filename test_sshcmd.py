@@ -13,7 +13,7 @@
 覆盖：
      1. 命令解析        多行 / 注释 / 从文档里复制来的提示符
      2. 命令行拼装      和用户给的原始命令逐字一致，附加参数按需补充
-     3. 目标地址解析    网段 / 单台 / 范围 / 前缀简写（10.127.112.1-56）
+     3. 目标地址解析    网段 / 单台 / 范围 / 前缀简写（192.168.1.1-56）
      4. 配置清洗        越界值夹回来，坏值不抛异常
      5. 会话式执行      成功 / 失败 / 已下发（重启）/ 要密码 / 连不上 / 卡住
      6. 逐条独立执行    真实退出码 / 公钥没生效 / 主机密钥没确认
@@ -94,7 +94,7 @@ for i, a in enumerate(args):
 ip = target.split("@", 1)[1] if target else "0.0.0.0"
 cmd = args[ti + 1] if (ti is not None and len(args) > ti + 1) else None
 interactive = cmd is None
-PROMPT = r"C:\Users\Lonovo>"
+PROMPT = r"C:\Users\admin>"
 
 def tail(n=1):
     return ip.rsplit(".", 1)[-1]
@@ -142,7 +142,7 @@ if interactive:
         out("ssh: connect to host %s port 22: Connection timed out" % ip)
         sys.exit(255)
     if tail() == "2":
-        sys.stdout.write("Lonovo@%s's password: " % ip)
+        sys.stdout.write("admin@%s's password: " % ip)
         sys.stdout.flush()
         sys.stdin.readline()
         out("Permission denied, please try again.")
@@ -209,7 +209,7 @@ def base_cfg(tmp: str, **over) -> dict:
     cfg.update({
         "ssh_exe": make_fake(tmp),
         "key": os.path.join(tmp, "id_ed25519"),     # 假私钥，假 ssh 不检查
-        "user": "Lonovo",
+        "user": "admin",
         "extra": "-o ConnectTimeout=10",
         "accept_new_hostkey": True,
         "mode": S.MODE_SESSION,
@@ -234,7 +234,7 @@ def test_parse_commands() -> None:
     cmds = S.parse_commands("hostname\n\n# 这是注释\n:: 也是注释\n  ipconfig /all  \n")
     check(cmds == ["hostname", "ipconfig /all"], "空行和注释被丢掉", str(cmds))
 
-    cmds = S.parse_commands('C:\\Users\\Lonovo>hostname\nPS C:\\> uwfmgr filter disable\n$ ls -l\n')
+    cmds = S.parse_commands('C:\\Users\\admin>hostname\nPS C:\\> uwfmgr filter disable\n$ ls -l\n')
     check(cmds == ["hostname", "uwfmgr filter disable", "ls -l"],
           "从文档里复制来的提示符被去掉", str(cmds))
 
@@ -255,24 +255,24 @@ def test_parse_commands() -> None:
 def test_argv() -> None:
     print("\n[2] 命令行拼装（要和用户给的原始命令一致）")
     cfg = S.normalize_cfg({
-        "key": r"C:\User\.ssh\id_ed25519", "user": "Lonovo",
+        "key": r"~/.ssh/id_ed25519", "user": "admin",
         "extra": "-o ConnectTimeout=10", "accept_new_hostkey": False,
     })
-    argv = S.ssh_argv(cfg, "10.127.112.98", "hostname")
+    argv = S.ssh_argv(cfg, "192.168.1.98", "hostname")
     check(argv[0].lower().endswith("ssh") or argv[0].lower().endswith("ssh.exe"),
           "用系统里的 ssh 客户端（优先完整路径）", argv[0])
-    check(argv[1:] == ["-i", r"C:\User\.ssh\id_ed25519",
+    check(argv[1:] == ["-i", r"~/.ssh/id_ed25519",
                        "-o", "ConnectTimeout=10",
-                       "Lonovo@10.127.112.98", "hostname"],
+                       "admin@192.168.1.98", "hostname"],
           "一次性执行 = ssh -i 私钥 参数 用户@IP 命令", " ".join(argv[1:]))
 
-    shown = S.display_command(cfg, "10.127.112.98", "hostname")
-    check(shown == 'ssh -i "C:\\User\\.ssh\\id_ed25519" -o ConnectTimeout=10 '
-                   'Lonovo@10.127.112.98 "hostname"',
+    shown = S.display_command(cfg, "192.168.1.98", "hostname")
+    check(shown == 'ssh -i "~/.ssh/id_ed25519" -o ConnectTimeout=10 '
+                   'admin@192.168.1.98 "hostname"',
           "界面上展示的等价命令", shown)
 
-    sess = S.ssh_argv(cfg, "10.127.112.98")
-    check(sess[-1] == "Lonovo@10.127.112.98", "会话式不带命令（登录后由程序发）")
+    sess = S.ssh_argv(cfg, "192.168.1.98")
+    check(sess[-1] == "admin@192.168.1.98", "会话式不带命令（登录后由程序发）")
 
     cfg2 = S.normalize_cfg({"key": "k", "user": "u", "extra": "",
                             "accept_new_hostkey": True})
@@ -309,37 +309,37 @@ def test_argv() -> None:
 def test_targets() -> None:
     print("\n[3] 目标地址解析")
     ips, _ = S.spec_ips("10.127.112.0/30")
-    check(ips == ["10.127.112.1", "10.127.112.2"], "网段 /30 → 2 个可用地址", str(ips))
+    check(ips == ["192.168.1.1", "192.168.1.2"], "网段 /30 → 2 个可用地址", str(ips))
 
-    ips, notes = S.spec_ips("10.127.112.1-10.127.112.4")
-    check(ips == ["10.127.112.1", "10.127.112.2", "10.127.112.3", "10.127.112.4"],
+    ips, notes = S.spec_ips("192.168.1.1-192.168.1.4")
+    check(ips == ["192.168.1.1", "192.168.1.2", "192.168.1.3", "192.168.1.4"],
           "完整范围写法", str(ips))
 
-    ips, notes = S.spec_ips("10.127.112.1-4")
-    check(ips == ["10.127.112.1", "10.127.112.2", "10.127.112.3", "10.127.112.4"],
-          "范围简写 10.127.112.1-4（UWF 工具的习惯写法）", str(ips))
+    ips, notes = S.spec_ips("192.168.1.1-4")
+    check(ips == ["192.168.1.1", "192.168.1.2", "192.168.1.3", "192.168.1.4"],
+          "范围简写 192.168.1.1-4（UWF 工具的习惯写法）", str(ips))
     check(any("展开" in n for n in notes), "简写展开会在提示里说明")
 
-    ips, _ = S.spec_ips("10.127.112.98")
-    check(ips == ["10.127.112.98"], "单台机器")
+    ips, _ = S.spec_ips("192.168.1.98")
+    check(ips == ["192.168.1.98"], "单台机器")
 
-    ips, _ = S.spec_ips("10.127.112.98, 10.127.112.5 10.127.112.98")
-    check(ips == ["10.127.112.5", "10.127.112.98"], "逗号/空格分隔 + 去重 + 排序", str(ips))
+    ips, _ = S.spec_ips("192.168.1.98, 192.168.1.5 192.168.1.98")
+    check(ips == ["192.168.1.5", "192.168.1.98"], "逗号/空格分隔 + 去重 + 排序", str(ips))
 
     ips, notes = S.spec_ips("不是地址")
     check(ips == [] and any("忽略" in n for n in notes), "非法输入被忽略并说明", str(notes))
 
-    ips, _ = S.spec_ips("10.127.112.1-56")
-    check(len(ips) == 56 and ips[0] == "10.127.112.1" and ips[-1] == "10.127.112.56",
+    ips, _ = S.spec_ips("192.168.1.1-56")
+    check(len(ips) == 56 and ips[0] == "192.168.1.1" and ips[-1] == "192.168.1.56",
           "简写范围能到 56 台（机房实际规模）", f"{len(ips)} 个")
 
     check(S.clean_ips(["10.0.0.9", "10.0.0.10", "10.0.0.9", "bad", ""])
           == ["10.0.0.9", "10.0.0.10"], "clean_ips 去重 / 排非法 / 按数字排序")
 
     same, other = S.split_hosts_by_reach(
-        ["10.127.112.5", "10.13.3.9"], ["10.127.112.153"],
-        ["10.127.112.0/24"])
-    check(same == ["10.127.112.5"] and other == ["10.13.3.9"],
+        ["192.168.1.5", "10.13.3.9"], ["192.168.1.100"],
+        ["192.168.1.0/24"])
+    check(same == ["192.168.1.5"] and other == ["10.13.3.9"],
           "能分出「同网段」和「跨网段」的机器", f"同网段 {same} 其他 {other}")
 
 
@@ -612,11 +612,11 @@ def test_pool() -> None:
 
 def test_batch() -> None:
     print("\n[8] 备用批处理（生成的文件必须纯 ASCII + CRLF）")
-    cfg = S.normalize_cfg({"key": r"C:\User\.ssh\id_ed25519", "user": "Lonovo",
+    cfg = S.normalize_cfg({"key": r"~/.ssh/id_ed25519", "user": "admin",
                            "extra": "-o ConnectTimeout=10",
                            "accept_new_hostkey": False,
                            "mode": S.MODE_ONESHOT})
-    hosts = ["10.127.112.1", "10.127.112.2"]
+    hosts = ["192.168.1.1", "192.168.1.2"]
     cmds = ["uwfmgr filter disable", "shutdown /r /t 0"]
     text = S.build_batch(hosts, cfg, cmds)
 
@@ -624,8 +624,8 @@ def test_batch() -> None:
     check("\r\r\n" not in text, "没有 \\r\\r\\n（换行被翻两次的坑）")
     check(all(ln.endswith("\r") or ln == "" for ln in text.split("\n")[:-1]),
           "每行都是 CRLF")
-    check('echo y | ssh -i "C:\\User\\.ssh\\id_ed25519" -o ConnectTimeout=10 '
-          'Lonovo@%IP% "uwfmgr filter disable"' in text,
+    check('echo y | ssh -i "~/.ssh/id_ed25519" -o ConnectTimeout=10 '
+          'admin@%IP% "uwfmgr filter disable"' in text,
           "和原始命令逐字一致（用 echo y 自动应答 yes）")
     check(text.count("call :one") == len(hosts), "每台机器一行 call")
     check("set /a OK+=1" in text and "set /a BAD+=1" in text, "有成功/失败计数")
